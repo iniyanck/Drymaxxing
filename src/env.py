@@ -1,0 +1,285 @@
+import gymnasium as gym
+from gymnasium import spaces
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
+try:
+    from src.paper import PaperSim
+except ImportError:
+    try:
+        from paper import PaperSim
+    except ImportError:
+        # Fallback
+        import sys
+        import os
+        sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+        from paper import PaperSim
+
+class PaperEnv(gym.Env):
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 4}
+
+    def __init__(self, render_mode=None, L=10.0, W=5.0, n_controls=5):
+        self.L = L
+        self.W = W
+        self.n_controls = n_controls
+        self.render_mode = render_mode
+        self.sim = PaperSim(L=L, W=W, n_profile=60, n_rulings=10)
+        
+        # Action Space: 
+        # [v_x, v_y, v_z, v_roll, v_pitch, v_yaw, d_k1...d_kn]
+        # Size = 6 + n_controls
+        self.action_dim = 6 + n_controls
+        self.action_space = spaces.Box(
+            low=-1.0, high=1.0, 
+            shape=(self.action_dim,), 
+            dtype=np.float32
+        )
+        
+        # Observation Space:
+        # [x, y, z, roll, pitch, yaw, k1...kn, rx, ry, rz]
+        # Added 3 for rain direction
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf,
+            shape=(9 + n_controls,),
+            dtype=np.float32
+        )
+        
+        # State
+        self.pos = np.zeros(3)
+        self.euler = np.zeros(3)
+        self.curvatures = np.zeros(n_controls)
+        self.rain_dir = np.array([0.0, 0.0, -1.0])
+        
+        self.max_linear_speed = 0.5 
+        self.max_angular_speed = 0.1 
+        self.max_k_speed = 0.1 
+        
+        self.max_steps = 200 # Increased for RL
+        self.current_step = 0
+        self.workspace_bounds = 12.0 # Slightly tighter to keep it visible
+        
+        # Camera State
+        self.cam_pos = np.array([0.0, -15.0, 10.0])
+        self.cam_elev = 30
+        self.cam_azim = -90
+        self.cam_speed = 0.5
+        self.look_speed = 5
+        
+        # Background stars (Relative offsets)
+        self.n_stars = 300
+        # Create a sphere of stars far away
+        r = 50.0
+        theta = np.random.uniform(0, 2*np.pi, self.n_stars)
+        phi = np.random.uniform(0, np.pi, self.n_stars)
+        self.stars_offset_x = r * np.sin(phi) * np.cos(theta)
+        self.stars_offset_y = r * np.sin(phi) * np.sin(theta)
+        self.stars_offset_z = r * np.cos(phi)
+
+        self.fig = None
+        self.ax = None
+        self.key_cid = None
+        
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.pos = np.random.uniform(-2, 2, 3) # Start near center
+        self.euler = np.random.uniform(-0.2, 0.2, 3)
+        self.curvatures = np.random.uniform(-0.01, 0.01, self.n_controls)
+        
+        # Randomize Rain Direction
+        # Random vector in lower hemisphere (z < 0)
+        # We can just pick a random point on sphere and flip z if needed
+        v = np.random.normal(0, 1, 3)
+        v /= np.linalg.norm(v)
+        if v[2] > 0: v[2] = -v[2]
+        # Bias towards down slightly
+        v[2] -= 0.5
+        v /= np.linalg.norm(v)
+        self.rain_dir = v
+
+        self.current_step = 0
+        self.sim.update(self.pos, self.euler, self.curvatures)
+        return self._get_obs(), {}
+
+    def _get_obs(self):
+        return np.concatenate((self.pos, self.euler, self.curvatures, self.rain_dir)).astype(np.float32)
+
+    def step(self, action):
+        action = np.clip(action, -1.0, 1.0)
+        
+        d_pos = action[0:3] * self.max_linear_speed
+        d_euler = action[3:6] * self.max_angular_speed
+        d_k = action[6:] * self.max_k_speed
+        
+        self.pos += d_pos
+        self.euler += d_euler
+        self.euler = (self.euler + np.pi) % (2 * np.pi) - np.pi
+        
+        # Boundary Check / penalty
+        # We allow it to move but penalize if it goes too far
+        # Hard clip center
+        self.pos = np.clip(self.pos, -self.workspace_bounds, self.workspace_bounds)
+        
+        # Floor Constraint (Hard)
+        # Check lowest vertex z
+        floor_level = -10.0
+        if self.sim.vertices is not None:
+             min_z = np.min(self.sim.vertices[:, :, 2])
+             if min_z < floor_level:
+                 # Push up
+                 diff = floor_level - min_z
+                 self.pos[2] += diff
+                 # Update sim immediately so next step acts on valid state
+                 self.sim.update(self.pos, self.euler, self.curvatures)
+
+        self.curvatures += d_k
+        self.curvatures = np.clip(self.curvatures, -2.0, 2.0)
+        
+        self.sim.update(self.pos, self.euler, self.curvatures)
+        
+        # Calculate Reward
+        wet_area = self.sim.calculate_wet_area(rain_dir=self.rain_dir)
+        max_area = self.L * self.W
+        
+        # Normalized wetness penalty (0 to 1)
+        wet_penalty = wet_area / max_area
+        
+        # Boundary Penalty
+        # Check if any vertex is out of bounds
+        clip_penalty = 0.0
+        if self.sim.vertices is not None:
+            # We check if absolute value of any vertex coordinate exceeds workspace_bounds
+            # For floor, we just check if it was pushed up (we can't easily track "was pushed" without state, 
+            # so we check closeness to floor or just use the center pos as a proxy for "too low")
+            # For now, let's just stick to the workspace bounds check
+            max_extent = np.max(np.abs(self.sim.vertices))
+            if max_extent > self.workspace_bounds:
+                clip_penalty = (max_extent - self.workspace_bounds) * 1.0 
+            
+            # Floor proximity penalty (optional, but good for learning)
+            min_z = np.min(self.sim.vertices[:, :, 2])
+            if min_z < floor_level + 0.5:
+                clip_penalty += (floor_level + 0.5 - min_z) * 1.0
+
+        # Total Reward
+        # We want to minimize wetness and minimize clipping.
+        # Max reward = 1.0 (perfectly dry, inside bounds)
+        # Wetness is 0..1
+        # Clip can be large
+        
+        reward = 1.0 - wet_penalty - clip_penalty
+        
+        self.current_step += 1
+        terminated = False
+        truncated = self.current_step >= self.max_steps
+        
+        if self.render_mode == "human":
+            self.render()
+            
+        return self._get_obs(), reward, terminated, truncated, {"wet_area": wet_area, "clip_penalty": clip_penalty}
+
+    def on_key_press(self, event):
+        # View Rotation (Arrows)
+        if event.key == 'up':
+            self.cam_elev += self.look_speed
+        elif event.key == 'down':
+            self.cam_elev -= self.look_speed
+        elif event.key == 'left':
+            self.cam_azim -= self.look_speed
+        elif event.key == 'right':
+            self.cam_azim += self.look_speed
+        
+        rad = np.radians(self.cam_azim)
+        dx = -np.sin(rad) * self.cam_speed
+        dy = np.cos(rad) * self.cam_speed
+        
+        if event.key == 'w':
+            self.cam_pos[0] += dx
+            self.cam_pos[1] += dy
+        elif event.key == 's':
+            self.cam_pos[0] -= dx
+            self.cam_pos[1] -= dy
+        elif event.key == 'a':
+            self.cam_pos[0] -= dy
+            self.cam_pos[1] += dx
+        elif event.key == 'd':
+            self.cam_pos[0] += dy
+            self.cam_pos[1] -= dx
+        elif event.key == 'q':
+            self.cam_pos[2] += self.cam_speed
+        elif event.key == 'e':
+            self.cam_pos[2] -= self.cam_speed
+            
+        self.cam_elev = np.clip(self.cam_elev, -90, 90)
+
+    def render(self):
+        if self.fig is None:
+            plt.ion()
+            self.fig = plt.figure(figsize=(10, 8))
+            self.ax = self.fig.add_subplot(111, projection='3d')
+            self.key_cid = self.fig.canvas.mpl_connect('key_press_event', self.on_key_press)
+        
+        self.ax.clear()
+        
+        self.ax.view_init(elev=self.cam_elev, azim=self.cam_azim)
+        
+        verts = self.sim.vertices
+        if verts is None: return
+        
+        X = verts[:, :, 0]
+        Y = verts[:, :, 1]
+        Z = verts[:, :, 2]
+        
+        # Draw skybox
+        sx = self.stars_offset_x + self.cam_pos[0]
+        sy = self.stars_offset_y + self.cam_pos[1]
+        sz = self.stars_offset_z + self.cam_pos[2]
+        self.ax.scatter(sx, sy, sz, c='white', s=2, alpha=0.3)
+        
+        self.ax.set_facecolor('#000010') 
+        self.ax.w_xaxis.set_pane_color((0.0, 0.0, 0.05, 1.0))
+        self.ax.w_yaxis.set_pane_color((0.0, 0.0, 0.05, 1.0))
+        self.ax.w_zaxis.set_pane_color((0.0, 0.0, 0.05, 1.0))
+        self.ax.grid(False) 
+        self.ax.set_axis_off() 
+        
+        # Rendering: Smooth Paper
+        self.ax.plot_surface(X, Y, Z, color='cyan', alpha=0.9, antialiased=True, shade=True)
+        
+        # Set bounds
+        R = 20.0 # Increased view range
+        cx, cy, cz = self.cam_pos
+        self.ax.set_xlim(cx - R, cx + R)
+        self.ax.set_ylim(cy - R, cy + R)
+        self.ax.set_zlim(cz - R, cz + R)
+        
+        self.ax.set_title(f"Rain: {self.rain_dir}", color='white')
+        
+        # Rain visualization (Directional)
+        # We draw lines along -rain_dir
+        # Rain falls along rain_dir
+        d = self.rain_dir
+        
+        # Spawn lines around camera or paper
+        center = self.pos
+        for _ in range(10):
+            # Random pt in box
+            rx = np.random.uniform(center[0]-5, center[0]+5)
+            ry = np.random.uniform(center[1]-5, center[1]+5)
+            rz = np.random.uniform(center[2]+5, center[2]+15)
+            
+            p1 = np.array([rx, ry, rz])
+            p2 = p1 + d * 5.0 # Line of length 5 along rain direction
+            
+            self.ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]], color='white', alpha=0.1, linewidth=1)
+            
+        # Visible Wet Blots
+        contacts_uv, contacts_w = self.sim.get_rain_contacts(n_drops=300, rain_dir=self.rain_dir)
+        if len(contacts_w) > 0:
+            self.ax.scatter(contacts_w[:, 0], contacts_w[:, 1], contacts_w[:, 2], c='blue', s=20, alpha=0.8)
+            
+        plt.pause(0.01)
+
+    def close(self):
+        if self.fig:
+            plt.close(self.fig)
