@@ -2,7 +2,7 @@ import numpy as np
 from scipy.interpolate import interp1d
 
 class PaperSim:
-    def __init__(self, L=10.0, W=10.0, n_profile=50, n_rulings=10):
+    def __init__(self, L=10.0, W=10.0, n_profile=50, n_rulings=50):
         """
         Initialize the Paper Simulation.
         
@@ -30,6 +30,52 @@ class PaperSim:
         self.x_loc = None # Local profile X
         self.z_loc = None # Local profile Z
         self.R = np.eye(3) # Rotation matrix
+        
+        # Wetness State
+        self.wet_mask = np.zeros((n_profile, n_rulings), dtype=bool)
+
+    def _check_self_intersection(self, x, z):
+        """
+        Check if the profile curve (x, z) intersects itself.
+        Simple O(N^2) segment intersection check.
+        Adjacent segments are ignored.
+        """
+        n = len(x)
+        if n < 4: return False
+        
+        # Pre-compute segments
+        # P[i] = (x[i], z[i])
+        # Segment i is P[i] -> P[i+1]
+        
+        # Vectorized approach or nested loop. Since N=50, nested loop is fine (2500 iter).
+        # We can optimize slightly.
+        
+        def ccw(A, B, C):
+            # Counter-clockwise check
+            return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
+
+        def intersect(A, B, C, D):
+            # Check if segment AB intersects CD
+            return ccw(A,C,D) != ccw(B,C,D) and ccw(A,B,C) != ccw(A,B,D)
+
+        points = np.column_stack((x, z))
+        
+        # Check all pairs of non-adjacent segments
+        # Segment i: points[i] to points[i+1]
+        # Segment j: points[j] to points[j+1]
+        # Check if i and j are not adjacent (i+1 != j and i != j+1 and i!=j)
+        
+        for i in range(n - 1):
+            A = points[i]
+            B = points[i+1]
+            # Start from i+2 to skip adjacent segment
+            for j in range(i + 2, n - 1):
+                C = points[j]
+                D = points[j+1]
+                
+                if intersect(A, B, C, D):
+                    return True
+        return False
 
     def update(self, position, euler_angles, curvature_controls):
         """
@@ -39,9 +85,11 @@ class PaperSim:
             position (array-like): [x, y, z] coordinates of the center.
             euler_angles (array-like): [roll, pitch, yaw] in radians.
             curvature_controls (array-like): Control points for curvature along s.
+            
+        Returns:
+            bool: True if update was successful (no collision), False otherwise.
         """
-        self.position = np.array(position, dtype=np.float32)
-        self.euler = np.array(euler_angles, dtype=np.float32)
+        # Calculate candidates first without updating self state
         
         # 1. Reconstruct curvature function k(s)
         controls = np.array(curvature_controls).flatten()
@@ -70,8 +118,15 @@ class PaperSim:
         x_loc -= x_loc[len(x_loc)//2]
         z_loc -= z_loc[len(z_loc)//2]
         
+        # Check Collision
+        if self._check_self_intersection(x_loc, z_loc):
+            return False
+
+        # If valid, commit state
         self.x_loc = x_loc
         self.z_loc = z_loc
+        self.position = np.array(position, dtype=np.float32)
+        self.euler = np.array(euler_angles, dtype=np.float32)
         
         # 3. Generate 3D Vertices
         # Local Grid Construction (Paper Frame)
@@ -129,6 +184,7 @@ class PaperSim:
         world_verts = rotated_verts + self.position
         
         self.vertices = world_verts.reshape(self.n_profile, self.n_rulings, 3)
+        return True
         
     def calculate_wet_area(self, rain_dir=None, resolution=100):
         """
@@ -149,7 +205,67 @@ class PaperSim:
         else:
             rain_dir = np.array([0, 0, -1])
 
-        return self._monte_carlo_area(rain_dir)
+        return self.get_wet_area()
+
+    def get_wet_area(self):
+        """
+        Calculate total wet area based on wet_mask.
+        """
+        # Approximate area per cell
+        # This is a bit rough since cells stretch, but for optimization it's okay.
+        # Total area = L * W
+        # N_cells = (n_profile-1) * (n_rulings-1) roughly
+        # Let's simple count fraction of vertices wet * Total Area
+        
+        fraction_wet = np.mean(self.wet_mask)
+        return fraction_wet * (self.L * self.W)
+
+    def reset_wetness(self):
+        self.wet_mask.fill(False)
+        
+    def apply_rain(self, rain_dir, n_drops=100):
+        """
+        Simulate rain drops and update wet_mask.
+        """
+        # Instantaneous Wetness: Reset mask
+        self.wet_mask.fill(False)
+        
+        contacts_uv, _ = self.get_rain_contacts(n_drops=n_drops, rain_dir=rain_dir)
+
+        
+        if len(contacts_uv) > 0:
+            # UV are normalized 0..1
+            # Convert to indices
+            # u -> profile index (0..n_profile-1)
+            # v -> ruling index (0..n_rulings-1)
+            
+            us = contacts_uv[:, 0]
+            vs = contacts_uv[:, 1]
+            
+            idx_u = (us * (self.n_profile - 1)).astype(int)
+            idx_v = (vs * (self.n_rulings - 1)).astype(int)
+            
+            # Clip safe
+            idx_u = np.clip(idx_u, 0, self.n_profile - 1)
+            idx_v = np.clip(idx_v, 0, self.n_rulings - 1)
+            
+            # Count newly wet
+            # Current mask at these indices
+            current_wetness = self.wet_mask[idx_u, idx_v]
+            # Convert to int (0 or 1), sum is existing wet count in this batch
+            
+            # We want to know how many traverse from False -> True
+            # Let's perform the update and check difference or just check before
+            
+            # Simple way: just count how many False in current_wetness
+            newly_wet = np.sum(~current_wetness)
+            
+            self.wet_mask[idx_u, idx_v] = True
+            
+            return newly_wet
+            
+        return 0
+
 
     def _monte_carlo_area(self, rain_dir, n_samples=2000):
         try:
@@ -269,7 +385,7 @@ class PaperSim:
         min_x, min_y = np.min(pts, axis=0)
         max_x, max_y = np.max(pts, axis=0)
         
-        pad = 1.0
+        pad = 5.0
         min_x -= pad; max_x += pad
         min_y -= pad; max_y += pad
         
@@ -280,7 +396,7 @@ class PaperSim:
         z_start_view = np.max(view_verts[:, 2]) + 10.0
         
         origins_view = np.column_stack((rand_x, rand_y, np.full(n_drops, z_start_view)))
-        dirs_view = np.tile(np.array([0, 0, -1]), (n_drops, 1))
+        dirs_view = np.tile(np.array([0.0, 0.0, -1.0]), (n_drops, 1))
         
         # Transform Rays back to World Frame
         origins_world = (R_view.T @ origins_view.T).T
@@ -288,6 +404,26 @@ class PaperSim:
         
         # Transform rays to Local Frame of the paper
         R_inv = self.R.T # Paper rotation inverse
+        
+        # Add directional noise to dirs_view before transforming
+        # We want to perturb the direction (originally [0, 0, -1]) slightly for each drop
+        # This makes the rain "randomized" / spray-like.
+        # Noise level (standard deviation of angle roughly)
+        noise_scale = 0.1 
+        
+        # We can add noise to x and y components of the direction in View Space.
+        # Since main dir is -Z, adding small x, y gives angle deviation.
+        noise = np.random.normal(0, noise_scale, (n_drops, 2))
+        dirs_view_noisy = dirs_view.copy()
+        dirs_view_noisy[:, 0] += noise[:, 0]
+        dirs_view_noisy[:, 1] += noise[:, 1]
+        
+        # Re-normalize
+        norms = np.linalg.norm(dirs_view_noisy, axis=1, keepdims=True)
+        dirs_view_noisy /= norms
+        
+        # Use noisy dirs for transformation
+        dirs_world = (R_view.T @ dirs_view_noisy.T).T
         
         origins_local = (R_inv @ (origins_world - self.position).T).T
         dirs_local = (R_inv @ dirs_world.T).T
@@ -323,8 +459,8 @@ class PaperSim:
                 start_x = Ax - Ox
                 start_z = Az - Oz
                 
-                t_val = (DeltaX * start_z - DeltaZ * start_x) / det
-                u_seg = (Dx * start_z - Dz * start_x) / det 
+                t_val = (DeltaZ * start_x - DeltaX * start_z) / det
+                u_seg = (Dz * start_x - Dx * start_z) / det 
                 
                 if 0.0 <= u_seg <= 1.0:
                     if t_val > 0 and t_val < best_t:

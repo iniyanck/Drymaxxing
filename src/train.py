@@ -44,8 +44,43 @@ class CEMAgent:
         
         return total_reward
 
-    def train(self, n_generations=20):
-        print(f"Starting CEM Training (Gen={n_generations}, Pop={self.pop_size})...")
+
+    def evaluate_batch(self, population_weights):
+        """
+        Evaluate the entire population in parallel using the batched environment.
+        population_weights: (Pop, Act*Obs)
+        """
+        import torch
+        
+        pop_size = population_weights.shape[0]
+        # Reset Env
+        obs = self.env.reset() # (Pop, Obs)
+        
+        total_rewards = torch.zeros(pop_size, device=self.env.device)
+        done = False
+        
+        # We need to reshape weights for batch matmul
+        # W: (Pop, Act, Obs)
+        # weights: (Pop, Act*Obs)
+        W = population_weights.view(pop_size, self.act_dim, self.obs_dim)
+        
+        for _ in range(self.env.max_steps):
+            # Action = tanh(W @ obs)
+            # Obs: (Pop, Obs, 1)
+            obs_uns = obs.unsqueeze(2)
+            act = torch.tanh(torch.bmm(W, obs_uns)).squeeze(2)
+            
+            obs, rewards, done, _ = self.env.step(act)
+            total_rewards += rewards
+            
+            if done: break
+            
+        return total_rewards.cpu().numpy()
+
+    def train(self, n_generations=20, use_cuda=False):
+        print(f"Starting CEM Training (Gen={n_generations}, Pop={self.pop_size}, CUDA={use_cuda})...")
+        
+        # If CUDA, convert mean/cov to torch if needed or just handle in loop
         
         for g in range(n_generations):
             samples = np.random.multivariate_normal(
@@ -54,11 +89,18 @@ class CEMAgent:
                 self.pop_size
             )
             
-            rewards = []
-            for w in samples:
-                rewards.append(self.evaluate(w))
+            if use_cuda:
+                import torch
+                # Convert samples to tensor
+                w_tensor = torch.tensor(samples, dtype=torch.float32, device=self.env.device)
+                rewards = self.evaluate_batch(w_tensor)
+            else:
+                rewards = []
+                for w in samples:
+                    rewards.append(self.evaluate(w))
+                rewards = np.array(rewards)
             
-            rewards = np.array(rewards)
+            # Elite Selection
             elite_idxs = rewards.argsort()[-self.n_elite:]
             elite_weights = samples[elite_idxs]
             
@@ -77,9 +119,39 @@ def main():
     parser.add_argument("--train", action="store_true", help="Train the agent")
     parser.add_argument("--view", action="store_true", help="View the result")
     parser.add_argument("--quick", action="store_true", help="Run a quick training session for testing")
+    parser.add_argument("--cuda", action="store_true", help="Use CUDA for training")
     args = parser.parse_args()
 
-    env = PaperEnv(render_mode="human" if args.view else None)
+    if args.cuda and args.train:
+        # Use Batched Env
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                print("Warning: CUDA not available, using CPU for tensor operations.")
+                device = "cpu"
+            else:
+                device = "cuda"
+            
+            try:
+                from src.torch_env import BatchPaperEnv
+            except ImportError:
+                from torch_env import BatchPaperEnv
+            # Pop size needed for env init?
+            # We usually define pop size in agent. 
+            # But BatchEnv needs batch size.
+            # Let's align them.
+            gens = 2 if args.quick else 15
+            pop_size = 10 if args.quick else 50
+            
+            env = BatchPaperEnv(batch_size=pop_size, device=device)
+            print(f"Initialized Batch Enviroment on {device}")
+            
+        except ImportError as e:
+            print(f"Failed to import Torch/CUDA modules: {e}")
+            return
+    else:
+        env = PaperEnv(render_mode="human" if args.view else None)
+
     agent = CEMAgent(env)
     
     weights_file = "agent_weights.npy"
@@ -89,7 +161,13 @@ def main():
         pop_size = 10 if args.quick else 50
         agent.pop_size = pop_size
         
-        best_weights = agent.train(n_generations=gens)
+        # If using batched env, make sure pop size matches
+        if args.cuda:
+             if agent.pop_size != env.batch_size:
+                 print("Error: Agent population size must match Environment batch size for CUDA training.")
+                 return
+        
+        best_weights = agent.train(n_generations=gens, use_cuda=args.cuda)
         np.save(weights_file, best_weights)
         print(f"Saved weights to {weights_file}")
         
@@ -102,6 +180,13 @@ def main():
                 expected_size = agent.obs_dim * agent.act_dim
                 if weights.size != expected_size:
                     raise ValueError(f"Size mismatch: expected {expected_size}, got {weights.size}")
+                
+                # If we used CUDA env for training, we might have a BatchEnv here.
+                # But for viewing we want a single instance human render.
+                # Re-init env if needed.
+                if hasattr(agent.env, 'batch_size'):
+                     print("Switching to standard env for visualization...")
+                     agent.env = PaperEnv(render_mode="human")
                 
                 print("Running simulation...")
                 agent.evaluate(weights, render=True)

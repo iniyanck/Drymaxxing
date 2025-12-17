@@ -163,13 +163,20 @@
         scene.add(dirLight);
 
         // Ground / Grid Reference (Floor at Z = -10)
-        const gridHelper = new THREE.GridHelper(40, 40, 0x444444, 0x222222);
-        gridHelper.rotation.x = Math.PI / 2; // Rotate to XY plane
-        gridHelper.position.set(0, 0, -10); // Floor Z level
-        scene.add(gridHelper);
+        // Ground / Floor (at Z = -10)
+        const floorGeo = new THREE.PlaneGeometry(100, 100);
+        const floorMat = new THREE.MeshStandardMaterial({
+            color: 0x111111,
+            roughness: 0.8,
+            metalness: 0.2
+        });
+        const floorMesh = new THREE.Mesh(floorGeo, floorMat);
+        floorMesh.position.set(0, 0, -10);
+        floorMesh.receiveShadow = true;
+        scene.add(floorMesh);
 
         // Paper Mesh
-        const paperGeo = new THREE.PlaneGeometry(10, 10, 9, 59);
+        const paperGeo = new THREE.PlaneGeometry(10, 10, 49, 49);
         paperGeo.attributes.position.usage = THREE.DynamicDrawUsage;
 
         // Wetness Texture (Canvas)
@@ -195,8 +202,9 @@
         paperMesh.receiveShadow = true;
         scene.add(paperMesh);
 
-        // Rain Visualization (Falling along -Z)
-        const rainCount = 3000;
+        // Rain Visualization (Falling along -RainDir)
+        let rainDir = new THREE.Vector3(0, 0, -1); // Default
+        const rainCount = 5000;
         const rainGeo = new THREE.BufferGeometry();
         const rainPos = new Float32Array(rainCount * 3);
         const rainVel = new Float32Array(rainCount);
@@ -208,36 +216,55 @@
         }
         rainGeo.setAttribute('position', new THREE.BufferAttribute(rainPos, 3));
         const rainMat = new THREE.PointsMaterial({
-            color: 0x88ccff,
-            size: 0.15,
+            color: 0x4488ff, // Blue rain
+            size: 0.2, // Slightly larger drops
             transparent: true,
-            opacity: 0.5,
+            opacity: 0.3, // subtler
             blending: THREE.AdditiveBlending
         });
         const rainSystem = new THREE.Points(rainGeo, rainMat);
         scene.add(rainSystem);
 
-        // Hit System remains the same (points)
+        // SPLASH TEXTURE GENERATION
+        function createSplashTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 32;
+            canvas.height = 32;
+            const context = canvas.getContext('2d');
+
+            // Draw a ring/splash
+            const gradient = context.createRadialGradient(16, 16, 0, 16, 16, 16);
+            gradient.addColorStop(0, 'rgba(100, 150, 255, 1)');
+            gradient.addColorStop(0.2, 'rgba(50, 100, 255, 0.8)');
+            gradient.addColorStop(0.4, 'rgba(0, 50, 200, 0.2)');
+            gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+
+            context.fillStyle = gradient;
+            context.fillRect(0, 0, 32, 32);
+
+            const texture = new THREE.CanvasTexture(canvas);
+            return texture;
+        }
+
+        // Hit System (Splashes)
         const MAX_HITS = 1000;
         const hitGeo = new THREE.BufferGeometry();
         const hitPos = new Float32Array(MAX_HITS * 3);
         hitGeo.setAttribute('position', new THREE.BufferAttribute(hitPos, 3));
+
         const hitMat = new THREE.PointsMaterial({
-            color: 0xffffff,
-            size: 0.4,
+            color: 0x88ccff, // Splash base color
+            size: 0.8, // Larger for splash
+            map: createSplashTexture(),
             transparent: true,
-            opacity: 0.8,
+            opacity: 0.9,
+            depthWrite: false,
             blending: THREE.AdditiveBlending
         });
         const hitSystem = new THREE.Points(hitGeo, hitMat);
         scene.add(hitSystem);
 
         // WebSocket
-        // ... (unchanged part skipped, reusing via replace if possible, but I am replacing block)
-        // I'll assume I need to keep the WebSocket logic. It was around line 250.
-        // I will use replace_file_content to target specific blocks to avoid deleting WS logic.
-
-
         // WebSocket
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
@@ -262,6 +289,10 @@
                 const avgK = data.curvatures.reduce((a, b) => a + b, 0) / data.curvatures.length;
                 document.getElementById('k-val').textContent = avgK.toFixed(4);
                 drawCurvatureHeatmap(data.curvatures);
+            }
+            if (data.rain_dir) {
+                // Update global rain dir
+                rainDir.set(data.rain_dir[0], data.rain_dir[1], data.rain_dir[2]).normalize();
             }
 
             // Update Paper Geometry
@@ -317,9 +348,12 @@
             }
         };
 
+        let uvInitialized = false;
+
         function updatePaper(flatVerts) {
             // Check sizes
             const positions = paperGeo.attributes.position.array;
+            const uvs = paperGeo.attributes.uv.array;
 
             // Expected size: 9x59 segments -> 10x60 points
             // flatVerts is typically [60][10][3]
@@ -334,8 +368,11 @@
             // Safety check
             if (!flatVerts || !flatVerts[0]) return;
 
-            for (let i = 0; i < flatVerts.length; i++) {
-                for (let j = 0; j < flatVerts[i].length; j++) {
+            const n_profile = flatVerts.length;
+            const n_rulings = flatVerts[0].length;
+
+            for (let i = 0; i < n_profile; i++) {
+                for (let j = 0; j < n_rulings; j++) {
                     if (idx < positions.length) {
                         const pt = flatVerts[i][j];
                         positions[idx++] = pt[0];
@@ -346,6 +383,25 @@
             }
             paperGeo.attributes.position.needsUpdate = true;
             paperGeo.computeVertexNormals();
+
+            // Initialize UVs once to match texture layout
+            if (!uvInitialized) {
+                idx = 0;
+                for (let i = 0; i < n_profile; i++) {
+                    for (let j = 0; j < n_rulings; j++) {
+                        // Profile -> U (X), Width -> V (Y)
+                        // Flip V to fix 180 degree mismatch
+                        const u = i / (n_profile - 1);
+                        const v = 1.0 - (j / (n_rulings - 1));
+
+                        uvs[2 * idx] = u;
+                        uvs[2 * idx + 1] = v;
+                        idx++;
+                    }
+                }
+                paperGeo.attributes.uv.needsUpdate = true;
+                uvInitialized = true;
+            }
         }
 
         function drawCurvatureHeatmap(k_vals) {
@@ -486,12 +542,41 @@
             requestAnimationFrame(animate);
             updateMovement();
 
-            // Animate global rain (Falls along -Z)
+            // Animate global rain (Falls along rainDir)
+            // We want rain to fall 'down' relative to the vector.
+            // Actually rainDir is the direction it falls TOWARDS.
+            // So we add rainDir * speed * dt.
+
             const rPos = rainSystem.geometry.attributes.position.array;
+
+            // Bounds
+            const bounds = 40;
+
             for (let i = 0; i < rainCount; i++) {
-                rPos[i * 3 + 2] -= rainVel[i];
-                if (rPos[i * 3 + 2] < -10) {
-                    rPos[i * 3 + 2] = 40;
+                const speed = rainVel[i];
+
+                rPos[i * 3] += rainDir.x * speed;
+                rPos[i * 3 + 1] += rainDir.y * speed;
+                rPos[i * 3 + 2] += rainDir.z * speed;
+
+                // Reset if out of bounds (simple box wrap)
+                // If it goes too low (below -10) or too far sideways
+                // We prefer to respawn it 'above' relative to rainDir.
+                // Simplified: just check Z and maybe distance.
+
+                if (rPos[i * 3 + 2] < -10 || Math.abs(rPos[i * 3]) > 80 || Math.abs(rPos[i * 3 + 1]) > 80) {
+                    // Respawn upwind
+                    const spawnZ = 30 + Math.random() * 20;
+                    // Wider destination area
+                    const destX = (Math.random() - 0.5) * 120;
+                    const destY = (Math.random() - 0.5) * 120;
+
+                    const rz = (Math.abs(rainDir.z) < 0.1) ? -0.1 : rainDir.z;
+                    const t = -spawnZ / rz;
+
+                    rPos[i * 3] = destX - rainDir.x * t;
+                    rPos[i * 3 + 1] = destY - rainDir.y * t;
+                    rPos[i * 3 + 2] = spawnZ;
                 }
             }
             rainSystem.geometry.attributes.position.needsUpdate = true;

@@ -19,12 +19,13 @@ except ImportError:
 class PaperEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 4}
 
-    def __init__(self, render_mode=None, L=10.0, W=5.0, n_controls=5):
+    def __init__(self, render_mode=None, L=10.0, W=5.0, n_controls=5, rain_mode='dynamic'):
         self.L = L
         self.W = W
         self.n_controls = n_controls
         self.render_mode = render_mode
-        self.sim = PaperSim(L=L, W=W, n_profile=60, n_rulings=10)
+        self.rain_mode = rain_mode
+        self.sim = PaperSim(L=L, W=W, n_profile=60, n_rulings=50)
         
         # Action Space: 
         # [v_x, v_y, v_z, v_roll, v_pitch, v_yaw, d_k1...d_kn]
@@ -98,6 +99,7 @@ class PaperEnv(gym.Env):
         self.rain_dir = v
 
         self.current_step = 0
+        self.sim.reset_wetness()
         self.sim.update(self.pos, self.euler, self.curvatures)
         return self._get_obs(), {}
 
@@ -132,21 +134,79 @@ class PaperEnv(gym.Env):
                  # Update sim immediately so next step acts on valid state
                  self.sim.update(self.pos, self.euler, self.curvatures)
 
+        # Try Update
+        # If collision, update() returns False.
+        # We need to revert curvatures if that happens.
+        
+        prev_curvatures = self.curvatures.copy()
         self.curvatures += d_k
         self.curvatures = np.clip(self.curvatures, -2.0, 2.0)
         
-        self.sim.update(self.pos, self.euler, self.curvatures)
+        success = self.sim.update(self.pos, self.euler, self.curvatures)
+        
+        collision_penalty = 0.0
+        if not success:
+            # Revert
+            self.curvatures = prev_curvatures
+            # Force update with old valid state to ensure consistency (sim state might be dirty if update failed partial - though my impl is clean)
+            # My impl of update doesn't change state if fail, but pos/euler were passed in.
+            # Wait, my update() impl separates candidate calc from state update. 
+            # If fail, self.pos/self.euler ARE NOT updated in sim.
+            # But self.pos/self.euler in ENV ARE updated (lines 116-123).
+            # So I should probably revert ENV pos/euler too? 
+            # Or just let it move but refuse to bend? 
+            # The collision is purely due to curvature (profile). Rigid body move doesn't cause self-intersection.
+            # So reverting curvatures is enough.
+            # However, we must ensure sim is in sync with env.pos/env.euler.
+            
+            # Since sim.update returned False, it did NOT update its internal pos/euler/profile.
+            # So we must call it again with valid curvatures and NEW pos/euler to just apply the movement.
+            self.sim.update(self.pos, self.euler, self.curvatures)
+            
+            collision_penalty = 10.0 # Large penalty
+        
+        if self.rain_mode == 'dynamic':
+            # Drift rain direction
+            # Small random rotation or just noise + normalize
+            noise = np.random.normal(0, 0.05, 3) # Small drift
+            self.rain_dir += noise
+            
+            # Bias towards down slightly to prevent it flipping up too easily
+            self.rain_dir[2] -= 0.02 
+            
+            # Normalize
+            self.rain_dir /= np.linalg.norm(self.rain_dir)
+            
+        # Apply Rain
+        # Now returns newly wet count
+        newly_wet_count = self.sim.apply_rain(rain_dir=self.rain_dir, n_drops=100)
         
         # Calculate Reward
         wet_area = self.sim.calculate_wet_area(rain_dir=self.rain_dir)
         max_area = self.L * self.W
         
         # Normalized wetness penalty (0 to 1)
-        wet_penalty = wet_area / max_area
+        current_wet_fraction = wet_area / max_area
+        
+        # New Reward Function:
+        # heavily penalize NEW wetness (delta)
+        # moderately penalize TOTAL wetness (static)
+        # This prevents "giving up"
+        
+        # Approximate area of newly wet drops
+        # Each drop is roughly 1 vertex? Or we just use count relative to total vertices
+        total_vertices = self.sim.n_profile * self.sim.n_rulings
+        newly_wet_fraction = newly_wet_count / total_vertices
+        
+        # Weights
+        w_delta = 50.0 # High penalty for getting MORE wet
+        w_static = 5.0 # Low penalty for BEING wet
+        
+        wet_penalty = (newly_wet_fraction * w_delta) + (current_wet_fraction * w_static)
         
         # Boundary Penalty
         # Check if any vertex is out of bounds
-        clip_penalty = 0.0
+        clip_penalty = collision_penalty # Start with collision penalty
         if self.sim.vertices is not None:
             # We check if absolute value of any vertex coordinate exceeds workspace_bounds
             # For floor, we just check if it was pushed up (we can't easily track "was pushed" without state, 
@@ -237,14 +297,37 @@ class PaperEnv(gym.Env):
         self.ax.scatter(sx, sy, sz, c='white', s=2, alpha=0.3)
         
         self.ax.set_facecolor('#000010') 
-        self.ax.w_xaxis.set_pane_color((0.0, 0.0, 0.05, 1.0))
-        self.ax.w_yaxis.set_pane_color((0.0, 0.0, 0.05, 1.0))
-        self.ax.w_zaxis.set_pane_color((0.0, 0.0, 0.05, 1.0))
+        self.ax.xaxis.set_pane_color((0.0, 0.0, 0.05, 1.0))
+        self.ax.yaxis.set_pane_color((0.0, 0.0, 0.05, 1.0))
+        self.ax.zaxis.set_pane_color((0.0, 0.0, 0.05, 1.0))
         self.ax.grid(False) 
         self.ax.set_axis_off() 
         
         # Rendering: Smooth Paper
-        self.ax.plot_surface(X, Y, Z, color='cyan', alpha=0.9, antialiased=True, shade=True)
+        # Map wet_mask to colors
+        # wet_mask is (n_profile, n_rulings) vertices
+        # Face colors need to be (n_profile-1, n_rulings-1)
+        # We'll just map vertex colors for simplicity if surface plot supports it, 
+        # but plot_surface expects facecolors to match face dimensions or fit.
+        
+        # Let's simple create a color array based on Z or just uniform Cyan
+        # But for wetness we want wet parts Blue.
+        
+        # wet_mask is at vertices.
+        mask = self.sim.wet_mask
+        # Create an RGBA array
+        # Dry: Cyan (0, 1, 1, 0.9)
+        # Wet: Blue (0, 0, 1, 0.9)
+        
+        colors = np.zeros(mask.shape + (4,))
+        colors[~mask] = [0, 1, 1, 0.9] # Cyan
+        colors[mask] = [0.1, 0.1, 0.8, 0.9] # Dark Blue
+        
+        self.ax.plot_surface(X, Y, Z, facecolors=colors, shade=False) # shade=False to use our colors exactly
+        # Note: plot_surface facecolors expects the color array to match the grid shape (Z.shape)
+        # It uses the color of the top-left vertex for the face usually? Or interpolates?
+        # Actually for facecolors=Z.shape, it maps each patch to the interaction. 
+        # Let's hope dimensionality works out (X, Y, Z have same shape as mask).
         
         # Set bounds
         R = 20.0 # Increased view range
