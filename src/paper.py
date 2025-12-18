@@ -33,6 +33,7 @@ class PaperSim:
         
         # Wetness State
         self.wet_mask = np.zeros((n_profile, n_rulings), dtype=bool)
+        self.self_intersecting = False
 
     def _check_self_intersection(self, x, z):
         """
@@ -118,11 +119,10 @@ class PaperSim:
         x_loc -= x_loc[len(x_loc)//2]
         z_loc -= z_loc[len(z_loc)//2]
         
-        # Check Collision
-        if self._check_self_intersection(x_loc, z_loc):
-            return False
-
-        # If valid, commit state
+        # Check Collision (Soft Constraint)
+        self.self_intersecting = self._check_self_intersection(x_loc, z_loc)
+        # We always commit state now, allowing "ghosting" with penalty
+        
         self.x_loc = x_loc
         self.z_loc = z_loc
         self.position = np.array(position, dtype=np.float32)
@@ -188,8 +188,8 @@ class PaperSim:
         
     def calculate_wet_area(self, rain_dir=None, resolution=100):
         """
-        Approximate the projected area (wet area) relative to the rain direction using Monte Carlo.
-        Minimizing this is the goal.
+        Calculate robust projected area using Monte Carlo.
+        This provides a smooth gradient for minimizing exposure.
         """
         if self.vertices is None:
             return 0.0
@@ -205,7 +205,8 @@ class PaperSim:
         else:
             rain_dir = np.array([0, 0, -1])
 
-        return self.get_wet_area()
+        # Use Robust Monte Carlo
+        return self._monte_carlo_area(rain_dir, n_samples=2000)
 
     def get_wet_area(self):
         """

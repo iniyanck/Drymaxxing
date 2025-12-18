@@ -3,6 +3,7 @@ import sys
 import os
 import argparse
 import time
+import matplotlib.pyplot as plt
 
 # Ensure src is in path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -82,6 +83,9 @@ class CEMAgent:
         
         # If CUDA, convert mean/cov to torch if needed or just handle in loop
         
+        avg_rewards = []
+        best_rewards = []
+        
         for g in range(n_generations):
             samples = np.random.multivariate_normal(
                 self.mean_weights, 
@@ -110,8 +114,25 @@ class CEMAgent:
             avg_reward = rewards.mean()
             best_reward = rewards.max()
             print(f"Gen {g+1}: Avg Reward={avg_reward:.2f}, Best Reward={best_reward:.2f}")
+            
+            avg_rewards.append(avg_reward)
+            best_rewards.append(best_reward)
 
         print("Training Complete.")
+        
+        # Plot Progress
+        plt.figure(figsize=(10, 5))
+        plt.plot(avg_rewards, label='Average Reward')
+        plt.plot(best_rewards, label='Best Reward')
+        plt.xlabel('Generation')
+        plt.ylabel('Reward')
+        plt.title('Training Progress')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig('training_progress.png')
+        print("Saved training progress to training_progress.png")
+        plt.close()
+
         return self.mean_weights
 
 def main():
@@ -140,8 +161,8 @@ def main():
             # We usually define pop size in agent. 
             # But BatchEnv needs batch size.
             # Let's align them.
-            gens = 2 if args.quick else 15
-            pop_size = 10 if args.quick else 50
+            gens = 2 if args.quick else 200
+            pop_size = 10 if args.quick else 500
             
             env = BatchPaperEnv(batch_size=pop_size, device=device)
             print(f"Initialized Batch Enviroment on {device}")
@@ -157,8 +178,8 @@ def main():
     weights_file = "agent_weights.npy"
     
     if args.train:
-        gens = 2 if args.quick else 15
-        pop_size = 10 if args.quick else 50
+        gens = 2 if args.quick else 200
+        pop_size = 10 if args.quick else 500
         agent.pop_size = pop_size
         
         # If using batched env, make sure pop size matches

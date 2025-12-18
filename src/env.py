@@ -135,35 +135,16 @@ class PaperEnv(gym.Env):
                  self.sim.update(self.pos, self.euler, self.curvatures)
 
         # Try Update
-        # If collision, update() returns False.
-        # We need to revert curvatures if that happens.
-        
+        # Update always returns True now (Soft Constraint)
         prev_curvatures = self.curvatures.copy()
         self.curvatures += d_k
         self.curvatures = np.clip(self.curvatures, -2.0, 2.0)
         
-        success = self.sim.update(self.pos, self.euler, self.curvatures)
+        self.sim.update(self.pos, self.euler, self.curvatures)
         
         collision_penalty = 0.0
-        if not success:
-            # Revert
-            self.curvatures = prev_curvatures
-            # Force update with old valid state to ensure consistency (sim state might be dirty if update failed partial - though my impl is clean)
-            # My impl of update doesn't change state if fail, but pos/euler were passed in.
-            # Wait, my update() impl separates candidate calc from state update. 
-            # If fail, self.pos/self.euler ARE NOT updated in sim.
-            # But self.pos/self.euler in ENV ARE updated (lines 116-123).
-            # So I should probably revert ENV pos/euler too? 
-            # Or just let it move but refuse to bend? 
-            # The collision is purely due to curvature (profile). Rigid body move doesn't cause self-intersection.
-            # So reverting curvatures is enough.
-            # However, we must ensure sim is in sync with env.pos/env.euler.
-            
-            # Since sim.update returned False, it did NOT update its internal pos/euler/profile.
-            # So we must call it again with valid curvatures and NEW pos/euler to just apply the movement.
-            self.sim.update(self.pos, self.euler, self.curvatures)
-            
-            collision_penalty = 10.0 # Large penalty
+        if self.sim.self_intersecting:
+            collision_penalty = 5.0 # Penalty for self-intersection
         
         if self.rain_mode == 'dynamic':
             # Drift rain direction
@@ -178,54 +159,44 @@ class PaperEnv(gym.Env):
             self.rain_dir /= np.linalg.norm(self.rain_dir)
             
         # Apply Rain
-        # Now returns newly wet count
+        # We still apply rain for visualization/wetness mask (optional now for reward but good for vis)
+        # Using a small number of drops for Vis is fine.
         newly_wet_count = self.sim.apply_rain(rain_dir=self.rain_dir, n_drops=100)
         
         # Calculate Reward
+        # Uses Robust Monte Carlo Projected Area
         wet_area = self.sim.calculate_wet_area(rain_dir=self.rain_dir)
         max_area = self.L * self.W
         
-        # Normalized wetness penalty (0 to 1)
+        # Normalized wetness penalty (0 to 1 ideally, but area can be slightly > L*W if strictly convex? No, projected area <= Surface Area)
         current_wet_fraction = wet_area / max_area
         
-        # New Reward Function:
-        # heavily penalize NEW wetness (delta)
-        # moderately penalize TOTAL wetness (static)
-        # This prevents "giving up"
-        
-        # Approximate area of newly wet drops
-        # Each drop is roughly 1 vertex? Or we just use count relative to total vertices
-        total_vertices = self.sim.n_profile * self.sim.n_rulings
-        newly_wet_fraction = newly_wet_count / total_vertices
+        # Reward Function:
+        # Minimize Projected Area directly.
+        # Stronger gradient.
         
         # Weights
-        w_delta = 50.0 # High penalty for getting MORE wet
-        w_static = 5.0 # Low penalty for BEING wet
+        w_area = 20.0 
         
-        wet_penalty = (newly_wet_fraction * w_delta) + (current_wet_fraction * w_static)
+        wet_penalty = current_wet_fraction * w_area
         
         # Boundary Penalty
         # Check if any vertex is out of bounds
-        clip_penalty = collision_penalty # Start with collision penalty
+        clip_penalty = collision_penalty # Include self-collision here
         if self.sim.vertices is not None:
             # We check if absolute value of any vertex coordinate exceeds workspace_bounds
-            # For floor, we just check if it was pushed up (we can't easily track "was pushed" without state, 
-            # so we check closeness to floor or just use the center pos as a proxy for "too low")
-            # For now, let's just stick to the workspace bounds check
             max_extent = np.max(np.abs(self.sim.vertices))
             if max_extent > self.workspace_bounds:
-                clip_penalty = (max_extent - self.workspace_bounds) * 1.0 
+                clip_penalty += (max_extent - self.workspace_bounds) * 5.0 
             
             # Floor proximity penalty (optional, but good for learning)
             min_z = np.min(self.sim.vertices[:, :, 2])
             if min_z < floor_level + 0.5:
-                clip_penalty += (floor_level + 0.5 - min_z) * 1.0
+                clip_penalty += (floor_level + 0.5 - min_z) * 5.0
 
         # Total Reward
         # We want to minimize wetness and minimize clipping.
-        # Max reward = 1.0 (perfectly dry, inside bounds)
-        # Wetness is 0..1
-        # Clip can be large
+        # Max reward = 1.0 (perfectly dry/edge-on, inside bounds)
         
         reward = 1.0 - wet_penalty - clip_penalty
         
