@@ -3,10 +3,12 @@ import json
 import threading
 import time
 import uvicorn
+import os
 from fastapi import FastAPI, WebSocket
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 import numpy as np
+from stable_baselines3 import PPO
 
 # Import environment
 from env import PaperEnv
@@ -31,36 +33,58 @@ class SimulationState:
         
         # Try to load weights
         weights = None
-        try:
-            weights = np.load("agent_weights.npy")
-            print("Loaded agent weights.")
-        except:
-            print("No weights found. Running random policy.")
+        ppo_model = None
+        
+        ppo_path = "models/PPO/ppo_paper_final.zip"
+        cem_path = "agent_weights.npy"
+        
+        if os.path.exists(ppo_path):
+            print(f"Loading PPO model from {ppo_path}...")
+            try:
+                ppo_model = PPO.load(ppo_path)
+                print("Loaded PPO model successfully.")
+            except Exception as e:
+                print(f"Error loading PPO model: {e}")
+        
+        if ppo_model is None:
+            if os.path.exists(cem_path):
+                try:
+                    weights = np.load(cem_path)
+                    print(f"Loaded CEM agent weights from {cem_path}.")
+                except Exception as e:
+                    print(f"Error loading CEM weights: {e}")
+            else:
+                print("No weights found. Running random policy.")
 
         # Agent helper
-        def get_action(w, o):
+        def get_action(w, model, o):
             # Prioritize Manual
             with self.lock:
                 if self.manual_action is not None and (time.time() - self.last_manual_input < self.manual_timeout):
                     return self.manual_action.copy()
             
-            # Same logic as train.py CEMAgent
-            if w is None:
-                return self.env.action_space.sample() * 0.1 # Small random moves
+            # PPO Model
+            if model is not None:
+                action, _ = model.predict(o, deterministic=True)
+                return action
             
-            # Reconstruct agent dims from env
-            obs_dim = self.env.observation_space.shape[0]
-            act_dim = self.env.action_space.shape[0]
+            # CEM Weights
+            if w is not None:
+                # Reconstruct agent dims from env
+                obs_dim = self.env.observation_space.shape[0]
+                act_dim = self.env.action_space.shape[0]
+                W = w.reshape(act_dim, obs_dim)
+                return np.tanh(W @ o)
             
-            W = w.reshape(act_dim, obs_dim)
-            return np.tanh(W @ o)
+            # Random Fallback
+            return self.env.action_space.sample() * 0.1 # Small random moves
 
         while self.running:
             try:
-                action = get_action(weights, obs)
+                action = get_action(weights, ppo_model, obs)
             except Exception as e:
                 # If weights are incompatible or any other error, fallback to random
-                # print(f"Agent error: {e}")
+                print(f"Agent error: {e}")
                 action = self.env.action_space.sample() * 0.1
 
             obs, reward, done, truncated, info = self.env.step(action)

@@ -14,6 +14,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=100000, help="Number of training steps")
     parser.add_argument("--test", action="store_true", help="Just test the env and model setup")
+    parser.add_argument("--device", type=str, default="cpu", choices=["auto", "cpu", "cuda"], help="Device to use for training")
     args = parser.parse_args()
 
     # Create environment
@@ -34,6 +35,7 @@ def main():
         os.makedirs(log_dir)
 
     # Initialize PPO Agent
+    print(f"Using device: {args.device}")
     model = PPO(
         "MlpPolicy", 
         env, 
@@ -43,7 +45,7 @@ def main():
         n_steps=2048,
         batch_size=64,
         gamma=0.99,
-        device="auto" 
+        device=args.device 
     )
 
     TIMESTEPS = args.steps
