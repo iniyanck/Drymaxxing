@@ -25,7 +25,7 @@
             top: 20px;
             left: 20px;
             color: #ffffff;
-            pointer-events: none;
+            pointer-events: auto;
             background: rgba(10, 10, 20, 0.7);
             padding: 20px;
             border-radius: 12px;
@@ -70,7 +70,7 @@
         canvas {
             border-radius: 4px;
             margin-top: 4px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
         }
 
         .controls-hint {
@@ -95,12 +95,7 @@
 
 <body>
     <div id="ui">
-        <h1>Drymaxxing HUD</h1>
-
-        <div class="stat-group">
-            <span class="stat-label">System Status</span>
-            <span class="stat-value" id="status" style="color: #ffaa00; font-size: 12px;">Initializing...</span>
-        </div>
+        <h1>drymaxxing</h1>
 
         <div class="stat-group">
             <span class="stat-label">Wetness</span>
@@ -124,12 +119,14 @@
 
         <div class="stat-group">
             <span class="stat-label">Wetness</span>
-            <canvas id="wet-heatmap" width="200" height="100" style="width: 100%; height: auto; border:1px solid #333; background:#111"></canvas>
+            <canvas id="wet-heatmap" width="200" height="100"
+                style="width: 100%; height: auto; border:1px solid #333; background:#111"></canvas>
         </div>
 
         <div class="stat-group">
             <span class="stat-label">Curvature</span>
-            <canvas id="curv-heatmap" width="200" height="20" style="width: 100%; height: auto; border:1px solid #333; background:#111"></canvas>
+            <canvas id="curv-heatmap" width="200" height="20"
+                style="width: 100%; height: auto; border:1px solid #333; background:#111"></canvas>
         </div>
 
         <div class="controls-hint">
@@ -138,6 +135,57 @@
             A/D - Strafe<br>
             Mouse - Look<br>
             Shift - Boost
+        </div>
+
+        <div class="stat-group" style="padding-top:10px; border-top:1px solid rgba(255,255,255,0.1)">
+            <h1 style="border:none; margin-bottom:10px;">Control Panel</h1>
+
+            <button id="btn-reset" style="
+                width: 100%; 
+                background: linear-gradient(45deg, #ff416c, #ff4b2b);
+                border: none; 
+                padding: 8px; 
+                color: white; 
+                border-radius: 4px; 
+                cursor: pointer; 
+                margin-bottom: 10px;
+                font-family: inherit;
+                font-weight: 600;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                box-shadow: 0 4px 10px rgba(255, 75, 43, 0.3);
+                transition: transform 0.1s;
+            " onmousedown="this.style.transform='scale(0.95)'" onmouseup="this.style.transform='scale(1)'">RESET
+                PAPER</button>
+
+            <div style="text-align:center; margin-bottom:10px;">
+                <span class="stat-label">RAIN DIRECTION</span>
+                <div id="joystick-container" style="
+                    width: 140px; 
+                    height: 140px; 
+                    background: rgba(255, 255, 255, 0.05); 
+                    border: 1px solid rgba(255, 255, 255, 0.2); 
+                    border-radius: 50%; 
+                    position: relative; 
+                    margin: 10px auto; 
+                    touch-action: none;
+                    box-shadow: inset 0 0 20px rgba(0,0,0,0.5);
+                ">
+                    <div id="joystick-handle" style="
+                        width: 40px; 
+                        height: 40px; 
+                        background: radial-gradient(circle at 30% 30%, #4facfe, #00f2fe); 
+                        border-radius: 50%; 
+                        position: absolute; 
+                        top: 50%; 
+                        left: 50%; 
+                        transform: translate(-50%, -50%); 
+                        cursor: pointer; 
+                        box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+                    "></div>
+                </div>
+                <div style="font-size:10px; color:#666;">DRAG TO CONTROL</div>
+            </div>
         </div>
 
         <!-- Off-screen indicator if needed -->
@@ -288,15 +336,126 @@
         // WebSocket
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
-        const statusEl = document.getElementById('status');
 
-        ws.onopen = () => {
-            statusEl.textContent = "CONNECTED";
-            statusEl.style.color = "#00ff88";
-        };
+
+        // Control Logic
+        document.getElementById('btn-reset').addEventListener('click', () => {
+            ws.send(JSON.stringify({ type: 'reset' }));
+        });
+
+        // Joystick Logic
+        const joystickContainer = document.getElementById('joystick-container');
+        const joystickHandle = document.getElementById('joystick-handle');
+        const joystickRadius = 70; // 140/2
+        const handleRadius = 20; // 40/2
+        const maxDist = joystickRadius - handleRadius;
+
+        let isDraggingRain = false;
+        let rainX = 0;
+        let rainY = 0;
+
+        function updateJoystickVisual(x, y) {
+            // x, y are normalized -1 to 1 approx
+            // Clamp visual to circle for display
+            // But we allow input to drive it
+
+            const moveX = x * maxDist;
+            const moveY = -y * maxDist; // Screen Y is down, so -Y moves up
+
+            joystickHandle.style.transform = `translate(calc(-50% + ${moveX}px), calc(-50% + ${moveY}px))`;
+        }
+
+        function sendRainUpdate() {
+            ws.send(JSON.stringify({
+                type: 'set_rain',
+                dir: [rainX, rainY, -1.0] // Constant Z down
+            }));
+        }
+
+        function handleJoystickMove(e) {
+            if (!isDraggingRain) return;
+
+            const rect = joystickContainer.getBoundingClientRect();
+            const centerX = rect.left + rect.width / 2;
+            const centerY = rect.top + rect.height / 2;
+
+            let clientX, clientY;
+            if (e.touches && e.touches.length > 0) {
+                clientX = e.touches[0].clientX;
+                clientY = e.touches[0].clientY;
+            } else {
+                clientX = e.clientX;
+                clientY = e.clientY;
+            }
+
+            let dx = clientX - centerX;
+            let dy = clientY - centerY;
+
+            // Normalize
+            let dist = Math.sqrt(dx * dx + dy * dy);
+
+            // Clamping physics dist
+            if (dist > maxDist) dist = maxDist;
+
+            const scale = 1.0 / maxDist;
+
+            // Re-calculate effective dx, dy from clamped dist to avoid jumping
+            // If we clamp dist, we need to preserve angle.
+            // Angle = atan2(dy, dx)
+            const angle = Math.atan2(dy, dx);
+            const clampedDx = Math.cos(angle) * dist;
+            const clampedDy = Math.sin(angle) * dist;
+
+            rainX = clampedDx * scale;
+            rainY = -(clampedDy * scale); // Up (dy<0) -> Y>0
+
+            updateJoystickVisual(rainX, rainY);
+            sendRainUpdate();
+        }
+
+        joystickContainer.addEventListener('mousedown', (e) => {
+            isDraggingRain = true;
+            handleJoystickMove(e);
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (isDraggingRain) {
+                e.preventDefault();
+                handleJoystickMove(e);
+            }
+        });
+
+        window.addEventListener('mouseup', () => {
+            isDraggingRain = false;
+        });
+
+        joystickContainer.addEventListener('touchstart', (e) => {
+            isDraggingRain = true;
+            handleJoystickMove(e);
+        }, { passive: false });
+
+        window.addEventListener('touchmove', (e) => {
+            if (isDraggingRain) {
+                e.preventDefault();
+                handleJoystickMove(e);
+            }
+        }, { passive: false });
+
+        window.addEventListener('touchend', () => {
+            isDraggingRain = false;
+        });
+
+
 
         ws.onmessage = (event) => {
             const data = JSON.parse(event.data);
+
+            // Update UI Joystick if not being dragged
+            if (data.rain_dir && !isDraggingRain) {
+                rainX = data.rain_dir[0];
+                rainY = data.rain_dir[1];
+                updateJoystickVisual(rainX, rainY);
+            }
 
             // Update Stats
             if (data.wet_area !== undefined)
@@ -428,20 +587,53 @@
             const ctx = document.getElementById('curv-heatmap').getContext('2d');
             const w = ctx.canvas.width;
             const h = ctx.canvas.height;
-            const barW = w / k_vals.length;
+
             ctx.clearRect(0, 0, w, h);
+
+            if (!k_vals || k_vals.length === 0) return;
+
+            // Handle single value case
+            if (k_vals.length === 1) {
+                const k = k_vals[0];
+                const intensity = Math.min(Math.abs(k) / 2.0, 1.0);
+                const g = Math.floor((1.0 - intensity) * 255);
+                if (k >= 0) {
+                    ctx.fillStyle = `rgb(${Math.floor(intensity * 255)}, ${g}, 0)`;
+                } else {
+                    ctx.fillStyle = `rgb(0, ${g}, ${Math.floor(intensity * 255)})`;
+                }
+                ctx.fillRect(0, 0, w, h);
+                return;
+            }
+
+            const gradient = ctx.createLinearGradient(0, 0, w, 0);
+
             for (let i = 0; i < k_vals.length; i++) {
                 const k = k_vals[i];
                 // Max curvature is clipped at 2.0 in env.py.
-                // We want a nice gradient. 
-                // Let's say full red at 2.0, green at 0.
+                // Green at 0.
+                // Positive k -> Red (Forward folding)
+                // Negative k -> Blue (Backward folding)
+
                 const intensity = Math.min(Math.abs(k) / 2.0, 1.0);
-                
-                const r = Math.floor(intensity * 255);
                 const g = Math.floor((1.0 - intensity) * 255);
-                ctx.fillStyle = `rgb(${r}, ${g}, 0)`;
-                ctx.fillRect(i * barW, 0, barW + 1, h); // +1 to avoid gaps
+                let colorString;
+
+                if (k >= 0) {
+                    const r = Math.floor(intensity * 255);
+                    colorString = `rgb(${r}, ${g}, 0)`;
+                } else {
+                    const b = Math.floor(intensity * 255);
+                    colorString = `rgb(0, ${g}, ${b})`;
+                }
+
+                // Normalize index to 0..1
+                const t = i / (k_vals.length - 1);
+                gradient.addColorStop(t, colorString);
             }
+
+            ctx.fillStyle = gradient;
+            ctx.fillRect(0, 0, w, h);
         }
 
         // Starfield Skybox
@@ -488,6 +680,7 @@
 
         // Mouse Events
         window.addEventListener('mousedown', (e) => {
+            if (e.target.closest('#ui')) return; // Ignore clicks on UI
             isDragging = true;
             lastMouseX = e.clientX;
             lastMouseY = e.clientY;

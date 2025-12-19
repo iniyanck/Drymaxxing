@@ -23,10 +23,38 @@ class SimulationState:
         self.latest_data = {}
         self.lock = threading.Lock()
         
+        
         # Manual Control
         self.manual_action = None
         self.last_manual_input = 0.0
         self.manual_timeout = 0.2 # Reset to none if no input for 0.2s
+
+    def handle_message(self, msg):
+        try:
+            if msg['type'] == 'reset':
+                with self.lock:
+                    self.env.reset()
+                    # Keep rain mode if it was set to fixed, or maybe reset to dynamic? 
+                    # User likely wants to keep their settings, but reset() randomizes rain.
+                    # We should probably re-apply desired rain if we are in fixed mode?
+                    # For now simpliest is just reset.
+            
+            elif msg['type'] == 'set_rain':
+                d = np.array(msg['dir'])
+                norm = np.linalg.norm(d)
+                if norm > 0:
+                    d = d / norm
+                    with self.lock:
+                        self.env.rain_dir = d
+                        # self.env.rain_mode = 'fixed' # Don't stop drifting, user wants random variation + control
+
+                        
+            elif msg['type'] == 'set_rain_mode':
+                with self.lock:
+                    self.env.rain_mode = msg.get('mode', 'dynamic')
+
+        except Exception as e:
+            print(f"Error handling message: {e}")
 
     def run_loop(self):
         obs, _ = self.env.reset()
@@ -87,23 +115,23 @@ class SimulationState:
                 print(f"Agent error: {e}")
                 action = self.env.action_space.sample() * 0.1
 
-            obs, reward, done, truncated, info = self.env.step(action)
-            
-            # Prepare data for frontend
-            # Vertices: (N_p, N_r, 3)
-            verts = self.env.sim.vertices
-            
-            # Rain contacts (Global) respecting current rain direction
-            contacts_uv, contacts_world = self.env.sim.get_rain_contacts(
-                n_drops=200, 
-                bounds=self.env.workspace_bounds,
-                rain_dir=self.env.rain_dir
-            )
-            
-            # Stats
-            wet_area = info.get("wet_area", 0)
-            
             with self.lock:
+                obs, reward, done, truncated, info = self.env.step(action)
+                
+                # Prepare data for frontend
+                # Vertices: (N_p, N_r, 3)
+                verts = self.env.sim.vertices
+                
+                # Rain contacts (Global) respecting current rain direction
+                contacts_uv, contacts_world = self.env.sim.get_rain_contacts(
+                    n_drops=200, 
+                    bounds=self.env.workspace_bounds,
+                    rain_dir=self.env.rain_dir
+                )
+                
+                # Stats
+                wet_area = info.get("wet_area", 0)
+                
                 self.latest_data = {
                     "vertices": verts.tolist() if verts is not None else [],
                     "rain_uv": contacts_uv.tolist(), 
@@ -137,10 +165,11 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 while True:
                     data = await websocket.receive_text()
-                    # We can handle camera events if needed, but for now client handles camera locally.
-                    # Just keep alive or log.
-                    # msg = json.loads(data)
-                    pass
+                    try:
+                         msg = json.loads(data)
+                         sim_state.handle_message(msg)
+                    except json.JSONDecodeError:
+                        pass
             except Exception as e:
                 print(f"WS Rx Error: {e}")
 
@@ -158,6 +187,8 @@ async def websocket_endpoint(websocket: WebSocket):
             await asyncio.sleep(0.033) # 30 FPS send rate
     except Exception as e:
         print(f"WebSocket Error: {e}")
+
+
 
 # Mount static files
 app.mount("/", StaticFiles(directory="src/static", html=True), name="static")

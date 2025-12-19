@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# Project specific
+logs/
+models/
+agent_weights.npy
+output.txt
+
+# IDE
+.vscode/
+.idea/

@@ -166,7 +166,7 @@ class PaperEnv(gym.Env):
             self.rain_dir += noise
             
             # Bias towards down slightly to prevent it flipping up too easily
-            self.rain_dir[2] -= 0.02 
+            self.rain_dir[2] -= 0.005 
             
             # Normalize
             self.rain_dir /= np.linalg.norm(self.rain_dir)
