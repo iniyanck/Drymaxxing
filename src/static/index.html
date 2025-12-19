@@ -5,12 +5,14 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Drymaxxing - Global Rain Visualization</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
     <style>
         body {
             margin: 0;
             overflow: hidden;
             /* Gradient Background: Stratosphere -> Horizon -> Ground */
             background: linear-gradient(to bottom, #020111 0%, #191621 40%, #2c3e50 50%, #1a1a1a 60%, #000000 100%);
+            font-family: 'Inter', sans-serif;
         }
 
         #canvas-container {
@@ -22,45 +24,62 @@
             position: absolute;
             top: 20px;
             left: 20px;
-            color: #daddff;
-            font-family: 'Consolas', 'Monaco', monospace;
+            color: #ffffff;
             pointer-events: none;
-            background: rgba(0, 0, 0, 0.6);
-            padding: 15px;
-            border-radius: 8px;
-            backdrop-filter: blur(4px);
-            border: 1px solid rgba(100, 140, 255, 0.2);
+            background: rgba(10, 10, 20, 0.7);
+            padding: 20px;
+            border-radius: 12px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
             z-index: 10;
+            width: 200px;
         }
 
         h1 {
-            margin: 0 0 10px 0;
-            font-size: 1.2rem;
+            margin: 0 0 15px 0;
+            font-size: 14px;
+            font-weight: 600;
             color: #4facfe;
             text-transform: uppercase;
-            letter-spacing: 2px;
+            letter-spacing: 1px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            padding-bottom: 10px;
         }
 
         .stat-group {
-            margin-bottom: 10px;
+            margin-bottom: 15px;
         }
 
         .stat-label {
-            font-size: 0.8rem;
+            font-size: 11px;
             color: #8899aa;
             display: block;
-            margin-bottom: 2px;
+            margin-bottom: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
 
         .stat-value {
-            font-size: 1rem;
-            font-weight: bold;
+            font-size: 15px;
+            font-weight: 600;
+            font-feature-settings: "tnum";
+            font-variant-numeric: tabular-nums;
+        }
+
+        canvas {
+            border-radius: 4px;
+            margin-top: 4px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.3);
         }
 
         .controls-hint {
-            margin-top: 15px;
-            font-size: 0.75rem;
-            color: #667788;
+            margin-top: 20px;
+            font-size: 10px;
+            color: #556677;
+            line-height: 1.5;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            padding-top: 10px;
         }
     </style>
     <!-- Three.js CDN -->
@@ -80,22 +99,22 @@
 
         <div class="stat-group">
             <span class="stat-label">System Status</span>
-            <span class="stat-value" id="status" style="color: #ffaa00">Initializing...</span>
+            <span class="stat-value" id="status" style="color: #ffaa00; font-size: 12px;">Initializing...</span>
         </div>
 
         <div class="stat-group">
-            <span class="stat-label">Wet Surface Area</span>
+            <span class="stat-label">Wetness</span>
             <span class="stat-value" id="wet-area">0.00</span> <span style="font-size:0.8em; color:#666">units²</span>
         </div>
 
         <div class="stat-group">
-            <span class="stat-label">Position (X, Y, Z)</span>
-            <span class="stat-value" id="pos-val">0.00, 0.00, 0.00</span>
+            <span class="stat-label">Position</span>
+            <span class="stat-value" id="pos-val" style="font-size: 12px;">0.0, 0.0, 0.0</span>
         </div>
 
         <div class="stat-group">
-            <span class="stat-label">Orientation (R, P, Y)</span>
-            <span class="stat-value" id="euler-val">0.00, 0.00, 0.00</span>
+            <span class="stat-label">Orientation</span>
+            <span class="stat-value" id="euler-val" style="font-size: 12px;">0.0, 0.0, 0.0</span>
         </div>
 
         <div class="stat-group">
@@ -104,20 +123,21 @@
         </div>
 
         <div class="stat-group">
-            <span class="stat-label">Wetness Heatmap</span>
-            <canvas id="wet-heatmap" width="150" height="75" style="border:1px solid #444; background:#111"></canvas>
+            <span class="stat-label">Wetness</span>
+            <canvas id="wet-heatmap" width="200" height="100" style="width: 100%; height: auto; border:1px solid #333; background:#111"></canvas>
         </div>
 
         <div class="stat-group">
-            <span class="stat-label">Curvature Heatmap</span>
-            <canvas id="curv-heatmap" width="150" height="20" style="border:1px solid #444; background:#111"></canvas>
+            <span class="stat-label">Curvature</span>
+            <canvas id="curv-heatmap" width="200" height="20" style="width: 100%; height: auto; border:1px solid #333; background:#111"></canvas>
         </div>
 
         <div class="controls-hint">
-            CONTROLS:<br>
-            [W/S] Move Camera Fwd/Back<br>
-            [A/D] Strafe Camera<br>
-            [Mouse] Rotate View
+            <b>CONTROLS</b><br>
+            W/S - Move<br>
+            A/D - Strafe<br>
+            Mouse - Look<br>
+            Shift - Boost
         </div>
 
         <!-- Off-screen indicator if needed -->
@@ -271,8 +291,8 @@
         const statusEl = document.getElementById('status');
 
         ws.onopen = () => {
-            statusEl.textContent = "Connected";
-            statusEl.style.color = "#4f4";
+            statusEl.textContent = "CONNECTED";
+            statusEl.style.color = "#00ff88";
         };
 
         ws.onmessage = (event) => {
@@ -282,7 +302,7 @@
             if (data.wet_area !== undefined)
                 document.getElementById('wet-area').textContent = data.wet_area.toFixed(2);
             if (data.pos)
-                document.getElementById('pos-val').textContent = data.pos.map(v => v.toFixed(2)).join(", ");
+                document.getElementById('pos-val').textContent = data.pos.map(v => v.toFixed(1)).join(", ");
             if (data.euler)
                 document.getElementById('euler-val').textContent = data.euler.map(v => v.toFixed(2)).join(", ");
             if (data.curvatures) {
@@ -322,7 +342,7 @@
 
             // Update HUD Heatmap
             const hudWetCtx = document.getElementById('wet-heatmap').getContext('2d');
-            hudWetCtx.drawImage(wetCanvas, 0, 0, 150, 75);
+            hudWetCtx.drawImage(wetCanvas, 0, 0, 200, 100);
 
             // Handle Rain Hits (3D)
             if (data.rain_hits && data.rain_hits.length > 0) {
@@ -412,11 +432,15 @@
             ctx.clearRect(0, 0, w, h);
             for (let i = 0; i < k_vals.length; i++) {
                 const k = k_vals[i];
-                const intensity = Math.min(Math.abs(k) * 20, 1.0);
+                // Max curvature is clipped at 2.0 in env.py.
+                // We want a nice gradient. 
+                // Let's say full red at 2.0, green at 0.
+                const intensity = Math.min(Math.abs(k) / 2.0, 1.0);
+                
                 const r = Math.floor(intensity * 255);
                 const g = Math.floor((1.0 - intensity) * 255);
                 ctx.fillStyle = `rgb(${r}, ${g}, 0)`;
-                ctx.fillRect(i * barW, 0, barW, h);
+                ctx.fillRect(i * barW, 0, barW + 1, h); // +1 to avoid gaps
             }
         }
 

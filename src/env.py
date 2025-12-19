@@ -19,12 +19,13 @@ except ImportError:
 class PaperEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 4}
 
-    def __init__(self, render_mode=None, L=10.0, W=5.0, n_controls=5, rain_mode='dynamic'):
+    def __init__(self, render_mode=None, L=10.0, W=5.0, n_controls=5, rain_mode='dynamic', render_rain_effects=True):
         self.L = L
         self.W = W
         self.n_controls = n_controls
         self.render_mode = render_mode
         self.rain_mode = rain_mode
+        self.render_rain_effects = render_rain_effects
         self.sim = PaperSim(L=L, W=W, n_profile=60, n_rulings=50)
         
         # Action Space: 
@@ -38,11 +39,11 @@ class PaperEnv(gym.Env):
         )
         
         # Observation Space:
-        # [x, y, z, roll, pitch, yaw, k1...kn, rx, ry, rz]
-        # Added 3 for rain direction
+        # [x, y, z, roll, pitch, yaw, k1...kn, rx, ry, rz, lx, ly, lz]
+        # Added 3 for global rain direction + 3 for local rain direction
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
-            shape=(9 + n_controls,),
+            shape=(12 + n_controls,),
             dtype=np.float32
         )
         
@@ -53,8 +54,8 @@ class PaperEnv(gym.Env):
         self.rain_dir = np.array([0.0, 0.0, -1.0])
         
         self.max_linear_speed = 0.5 
-        self.max_angular_speed = 0.1 
-        self.max_k_speed = 0.1 
+        self.max_angular_speed = 0.25 
+        self.max_k_speed = 0.2 
         
         self.max_steps = 200 # Increased for RL
         self.current_step = 0
@@ -104,7 +105,19 @@ class PaperEnv(gym.Env):
         return self._get_obs(), {}
 
     def _get_obs(self):
-        return np.concatenate((self.pos, self.euler, self.curvatures, self.rain_dir)).astype(np.float32)
+        # Calculate local rain direction
+        # R maps local -> global
+        # R.T maps global -> local
+        # If sim.R is not set (first reset), it might be identity
+        local_rain = self.sim.R.T @ self.rain_dir
+        
+        return np.concatenate((
+            self.pos, 
+            self.euler, 
+            self.curvatures, 
+            self.rain_dir,
+            local_rain
+        )).astype(np.float32)
 
     def step(self, action):
         action = np.clip(action, -1.0, 1.0)
@@ -161,7 +174,8 @@ class PaperEnv(gym.Env):
         # Apply Rain
         # We still apply rain for visualization/wetness mask (optional now for reward but good for vis)
         # Using a small number of drops for Vis is fine.
-        newly_wet_count = self.sim.apply_rain(rain_dir=self.rain_dir, n_drops=100)
+        if self.render_rain_effects:
+            newly_wet_count = self.sim.apply_rain(rain_dir=self.rain_dir, n_drops=100)
         
         # Calculate Reward
         # Uses Robust Monte Carlo Projected Area
@@ -194,11 +208,16 @@ class PaperEnv(gym.Env):
             if min_z < floor_level + 0.5:
                 clip_penalty += (floor_level + 0.5 - min_z) * 5.0
 
+        # Stability Penalty: Penalize high angular velocity
+        # d_euler is in rang [-max_angular_speed, max_angular_speed]
+        # We want to encourage it to be 0 when optimal.
+        stability_penalty = np.sum(np.square(action[3:6])) * 0.005
+        
         # Total Reward
         # We want to minimize wetness and minimize clipping.
         # Max reward = 1.0 (perfectly dry/edge-on, inside bounds)
         
-        reward = 1.0 - wet_penalty - clip_penalty
+        reward = 1.0 - wet_penalty - clip_penalty - stability_penalty
         
         self.current_step += 1
         terminated = False

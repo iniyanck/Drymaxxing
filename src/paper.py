@@ -38,45 +38,73 @@ class PaperSim:
     def _check_self_intersection(self, x, z):
         """
         Check if the profile curve (x, z) intersects itself.
-        Simple O(N^2) segment intersection check.
+        Vectorized O(N^2) segment intersection check.
         Adjacent segments are ignored.
         """
-        n = len(x)
+        points = np.column_stack((x, z))
+        n = len(points)
         if n < 4: return False
         
-        # Pre-compute segments
-        # P[i] = (x[i], z[i])
-        # Segment i is P[i] -> P[i+1]
+        # Create segments: (N-1) segments
+        # each segment is defined by p1, p2
+        # segments shape: (N-1, 2, 2) where last dim is (x,y)
+        P1 = points[:-1]
+        P2 = points[1:]
         
-        # Vectorized approach or nested loop. Since N=50, nested loop is fine (2500 iter).
-        # We can optimize slightly.
+        # We need to compare segment i with segment j where j > i + 1
+        n_seg = n - 1
         
-        def ccw(A, B, C):
-            # Counter-clockwise check
-            return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
-
-        def intersect(A, B, C, D):
-            # Check if segment AB intersects CD
-            return ccw(A,C,D) != ccw(B,C,D) and ccw(A,B,C) != ccw(A,B,D)
-
-        points = np.column_stack((x, z))
+        # Generate indices of pairs (i, j)
+        idx_i, idx_j = np.triu_indices(n_seg, k=2)
         
-        # Check all pairs of non-adjacent segments
-        # Segment i: points[i] to points[i+1]
-        # Segment j: points[j] to points[j+1]
-        # Check if i and j are not adjacent (i+1 != j and i != j+1 and i!=j)
+        if len(idx_i) == 0:
+            return False
+            
+        # Extract segment points
+        # Segment 1: A->B
+        A = P1[idx_i]
+        B = P2[idx_i]
         
-        for i in range(n - 1):
-            A = points[i]
-            B = points[i+1]
-            # Start from i+2 to skip adjacent segment
-            for j in range(i + 2, n - 1):
-                C = points[j]
-                D = points[j+1]
-                
-                if intersect(A, B, C, D):
-                    return True
-        return False
+        # Segment 2: C->D
+        C = P1[idx_j]
+        D = P2[idx_j]
+        
+        # Vectorized CCW
+        # ccw(P1, P2, P3): (y3-y1)*(x2-x1) > (y2-y1)*(x3-x1)
+        
+        def ccw(p1, p2, p3):
+            val = (p3[:, 1] - p1[:, 1]) * (p2[:, 0] - p1[:, 0]) - (p2[:, 1] - p1[:, 1]) * (p3[:, 0] - p1[:, 0])
+            return val
+            
+        # CCW checks
+        # intersect(A,B,C,D) is true if:
+        # ccw(A,C,D) != ccw(B,C,D) and ccw(A,B,C) != ccw(A,B,D)
+        
+        # Note: strict inequality for typical intersection check.
+        # But for self-intersection of a continuous curve, touching is fine (it's connected).
+        # We look for crossing.
+        
+        val_acd = ccw(A, C, D)
+        val_bcd = ccw(B, C, D)
+        val_abc = ccw(A, B, C)
+        val_abd = ccw(A, B, D)
+        
+        # Check signs
+        # intersect if signs differ: > 0 and < 0
+        
+        cond1 = (val_acd > 0) != (val_bcd > 0)
+        cond2 = (val_abc > 0) != (val_abd > 0)
+        
+        # Also handle collinearity if needed, but for "crossing" simple sign check is usually enough.
+        # Ideally check (val * val < 0) or similar.
+        # Using strict sign comparison (True/False) works for crossing.
+        
+        # One edge case: if val is exactly 0. 
+        # But with floats unlikely unless exact overlap.
+        
+        intersections = cond1 & cond2
+        
+        return np.any(intersections)
 
     def update(self, position, euler_angles, curvature_controls):
         """
@@ -316,20 +344,71 @@ class PaperSim:
         points = np.column_stack((rand_x, rand_y))
         
         # 3. Check collision
-        hit_mask = np.zeros(n_samples, dtype=bool)
+        # Optimization: Create one single Compound Path for all quads.
+        # This replaces the loop over n_profile with a single vectorized check.
         
-        for i in range(self.n_profile - 1):
-            p1 = view_verts[i, 0, :2]
-            p2 = view_verts[i+1, 0, :2]
-            p3 = view_verts[i+1, -1, :2]
-            p4 = view_verts[i, -1, :2]
-            
-            poly_verts = np.array([p1, p2, p3, p4, p1])
-            path = Path(poly_verts)
-            
-            in_poly = path.contains_points(points)
-            hit_mask = np.logical_or(hit_mask, in_poly)
-            
+        # Extract quads
+        # view_verts shape: (n_profile, n_rulings, 3)
+        # We use the strip definition: Quads formed by profile edges at ruling 0 and -1
+        
+        P1 = view_verts[:-1, 0, :2]    # (N, 2)
+        P2 = view_verts[1:, 0, :2]     # (N, 2)
+        P3 = view_verts[1:, -1, :2]    # (N, 2)
+        P4 = view_verts[:-1, -1, :2]   # (N, 2)
+        
+        # Ensure consistent winding (CCW) to prevents overlaps from canceling out (winding rule)
+        # Calculate signed area (shoelace for quad) approx or cross product
+        # Vectorized Cross Product (2D) for P1->P2 and P1->P4 (approx) or just check signed area
+        # Area = 0.5 * |(x1y2 - y1x2) + (x2y3 - y2x3) + (x3y4 - y3x4) + (x4y1 - y4x1)|
+        # We need the signed version.
+        
+        x1, y1 = P1[:,0], P1[:,1]
+        x2, y2 = P2[:,0], P2[:,1]
+        x3, y3 = P3[:,0], P3[:,1]
+        x4, y4 = P4[:,0], P4[:,1]
+        
+        signed_area = 0.5 * (
+            (x1*y2 - x2*y1) + 
+            (x2*y3 - x3*y2) + 
+            (x3*y4 - x4*y3) + 
+            (x4*y1 - x1*y4)
+        )
+        
+        # Identify CW quads (area < 0) and swap to make them CCW
+        # We can just swap P2 and P4 for those indices
+        swap_mask = signed_area < 0
+        
+        # Create final arrays
+        # We'll build the array (N, 5, 2)
+        quads = np.zeros((len(P1), 5, 2))
+        
+        # Standard: P1 -> P2 -> P3 -> P4 -> P1
+        quads[~swap_mask, 0] = P1[~swap_mask]
+        quads[~swap_mask, 1] = P2[~swap_mask]
+        quads[~swap_mask, 2] = P3[~swap_mask]
+        quads[~swap_mask, 3] = P4[~swap_mask]
+        quads[~swap_mask, 4] = P1[~swap_mask]
+        
+        # Swapped: P1 -> P4 -> P3 -> P2 -> P1 (Reversed)
+        quads[swap_mask, 0] = P1[swap_mask]
+        quads[swap_mask, 1] = P4[swap_mask] # Swapped
+        quads[swap_mask, 2] = P3[swap_mask]
+        quads[swap_mask, 3] = P2[swap_mask] # Swapped
+        quads[swap_mask, 4] = P1[swap_mask]
+        
+        # Flatten to (N*5, 2)
+        all_verts = quads.reshape(-1, 2)
+        
+        # Create Codes
+        n_quads = len(P1)
+        codes = np.full(n_quads * 5, Path.LINETO, dtype=np.uint8)
+        codes[0::5] = Path.MOVETO
+        codes[4::5] = Path.CLOSEPOLY
+        
+        path = Path(all_verts, codes)
+        
+        # Single check
+        hit_mask = path.contains_points(points)
         n_hits = np.sum(hit_mask)
         return (n_hits / n_samples) * area_bbox
 
