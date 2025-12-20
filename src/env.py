@@ -29,9 +29,9 @@ class PaperEnv(gym.Env):
         self.sim = PaperSim(L=L, W=W, n_profile=60, n_rulings=50)
         
         # Action Space: 
-        # [v_x, v_y, v_z, v_roll, v_pitch, v_yaw, d_k1...d_kn]
-        # Size = 6 + n_controls
-        self.action_dim = 6 + n_controls
+        # [v_x, v_y, v_z, v_roll, v_pitch, v_yaw, v_curl, d_k1...d_kn]
+        # Size = 7 + n_controls
+        self.action_dim = 7 + n_controls
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, 
             shape=(self.action_dim,), 
@@ -39,22 +39,24 @@ class PaperEnv(gym.Env):
         )
         
         # Observation Space:
-        # [x, y, z, roll, pitch, yaw, k1...kn, rx, ry, rz, lx, ly, lz]
+        # [x, y, z, roll, pitch, yaw, curl_angle, k1...kn, rx, ry, rz, lx, ly, lz]
         # Added 3 for global rain direction + 3 for local rain direction
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
-            shape=(12 + n_controls,),
+            shape=(13 + n_controls,),
             dtype=np.float32
         )
         
         # State
         self.pos = np.zeros(3)
         self.euler = np.zeros(3)
+        self.curl_angle = 0.0
         self.curvatures = np.zeros(n_controls)
         self.rain_dir = np.array([0.0, 0.0, -1.0])
         
         self.max_linear_speed = 0.5 
-        self.max_angular_speed = 0.25 
+        self.max_angular_speed = 0.25
+        self.max_curl_speed = 0.1 # Slow rotation for bending axis
         self.max_k_speed = 0.2 
         
         self.max_steps = 200 # Increased for RL
@@ -86,6 +88,7 @@ class PaperEnv(gym.Env):
         super().reset(seed=seed)
         self.pos = np.random.uniform(-2, 2, 3) # Start near center
         self.euler = np.random.uniform(-0.2, 0.2, 3)
+        self.curl_angle = np.random.uniform(-np.pi, np.pi) # Any initial orientation
         self.curvatures = np.random.uniform(-0.01, 0.01, self.n_controls)
         
         # Randomize Rain Direction
@@ -101,7 +104,8 @@ class PaperEnv(gym.Env):
 
         self.current_step = 0
         self.sim.reset_wetness()
-        self.sim.update(self.pos, self.euler, self.curvatures)
+        self.sim.reset_wetness()
+        self.sim.update(self.pos, self.euler, self.curvatures, self.curl_angle)
         return self._get_obs(), {}
 
     def _get_obs(self):
@@ -113,7 +117,8 @@ class PaperEnv(gym.Env):
         
         return np.concatenate((
             self.pos, 
-            self.euler, 
+            self.euler,
+            [self.curl_angle],
             self.curvatures, 
             self.rain_dir,
             local_rain
@@ -124,11 +129,15 @@ class PaperEnv(gym.Env):
         
         d_pos = action[0:3] * self.max_linear_speed
         d_euler = action[3:6] * self.max_angular_speed
-        d_k = action[6:] * self.max_k_speed
+        d_curl = action[6] * self.max_curl_speed
+        d_k = action[7:] * self.max_k_speed
         
         self.pos += d_pos
         self.euler += d_euler
         self.euler = (self.euler + np.pi) % (2 * np.pi) - np.pi
+        
+        self.curl_angle += d_curl
+        self.curl_angle = (self.curl_angle + np.pi) % (2 * np.pi) - np.pi
         
         # Boundary Check / penalty
         # We allow it to move but penalize if it goes too far
@@ -145,7 +154,7 @@ class PaperEnv(gym.Env):
                  diff = floor_level - min_z
                  self.pos[2] += diff
                  # Update sim immediately so next step acts on valid state
-                 self.sim.update(self.pos, self.euler, self.curvatures)
+                 self.sim.update(self.pos, self.euler, self.curvatures, self.curl_angle)
 
         # Try Update
         # Update always returns True now (Soft Constraint)
@@ -153,7 +162,7 @@ class PaperEnv(gym.Env):
         self.curvatures += d_k
         self.curvatures = np.clip(self.curvatures, -2.0, 2.0)
         
-        self.sim.update(self.pos, self.euler, self.curvatures)
+        self.sim.update(self.pos, self.euler, self.curvatures, self.curl_angle)
         
         collision_penalty = 0.0
         if self.sim.self_intersecting:

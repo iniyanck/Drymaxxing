@@ -27,9 +27,16 @@ class PaperSim:
         # State
         self.position = np.zeros(3)
         self.euler = np.zeros(3) # roll, pitch, yaw
+        self.curl_angle = 0.0 # Angle of the bending axis in XY plane
         self.x_loc = None # Local profile X
         self.z_loc = None # Local profile Z
         self.R = np.eye(3) # Rotation matrix
+        
+        # Grid points of the flat paper (mesh material coordinates)
+        # Defined once since paper is rigid
+        xv, yv = np.meshgrid(self.s, self.r, indexing='ij')
+        self.mat_x = xv # Material X coord
+        self.mat_y = yv # Material Y coord
         
         # Wetness State
         self.wet_mask = np.zeros((n_profile, n_rulings), dtype=bool)
@@ -106,7 +113,7 @@ class PaperSim:
         
         return np.any(intersections)
 
-    def update(self, position, euler_angles, curvature_controls):
+    def update(self, position, euler_angles, curvature_controls, curl_angle=0.0):
         """
         Update the paper geometry based on pose and curvature controls.
         
@@ -114,104 +121,169 @@ class PaperSim:
             position (array-like): [x, y, z] coordinates of the center.
             euler_angles (array-like): [roll, pitch, yaw] in radians.
             curvature_controls (array-like): Control points for curvature along s.
+            curl_angle (float): Angle of the curling axis. 0 = Curl along X (roll along Y).
             
         Returns:
             bool: True if update was successful (no collision), False otherwise.
         """
-        # Calculate candidates first without updating self state
+        # Save state
+        self.position = np.array(position, dtype=np.float32)
+        self.euler = np.array(euler_angles, dtype=np.float32)
+        self.curl_angle = curl_angle
         
-        # 1. Reconstruct curvature function k(s)
+        # 1. Determine "Profile Space" coordinates
+        # We rotate the material coordinates (mat_x, mat_y) by -curl_angle around Z.
+        # u: component along bending direction (profile direction)
+        # v: component along ruling direction (straight line)
+        
+        c = np.cos(curl_angle)
+        s = np.sin(curl_angle)
+        
+        # u = x * cos(theta) + y * sin(theta)
+        # v = -x * sin(theta) + y * cos(theta)
+        # Note: This is a rotation of the coordinate system by theta.
+        
+        u_mesh = self.mat_x * c + self.mat_y * s
+        v_mesh = -self.mat_x * s + self.mat_y * c
+        
+        # Determine necessary extent of profile generation
+        u_min, u_max = np.min(u_mesh), np.max(u_mesh)
+        
+        # 2. Reconstruct curvature function k(s)
         controls = np.array(curvature_controls).flatten()
         n_controls = len(controls)
         
+        # We need to generate the profile over [u_min, u_max]
+        # But curvature controls are usually defined over the "length" of the paper.
+        # If we rotate, the "effective length" changes.
+        # Option A: Stretch curvature controls to cover new extent.
+        # Option B: Curvature controls map to Material X, and we project? 
+        #   No, that implies bending varies with X, which contradicts "generalized cylinder along angle".
+        # Option C: Curvature is defined along the 'u' axis (bending axis).
+        #   We assume controls cover [-L_eff/2, L_eff/2].
+        #   Let's just map controls linearly to [u_min, u_max].
+        
+        # High-res profile generation for interpolation
+        n_gen = int(self.n_profile * 1.5) # Higher res for interpolation
+        s_gen = np.linspace(u_min, u_max, n_gen)
+        
         if n_controls < 2:
-            k_s = np.full_like(self.s, controls[0] if n_controls > 0 else 0)
+            k_gen = np.full_like(s_gen, controls[0] if n_controls > 0 else 0)
         else:
-            control_s = np.linspace(self.s[0], self.s[-1], n_controls)
+            control_s = np.linspace(u_min, u_max, n_controls)
             f_k = interp1d(control_s, controls, kind='linear', fill_value="extrapolate")
-            k_s = f_k(self.s)
+            k_gen = f_k(s_gen)
             
-        # 2. Integrate to get profile curve in local XZ frame
-        ds = self.s[1] - self.s[0]
-        theta = np.cumsum(k_s) * ds
-        # Fix tangent at center to be flat
-        theta = theta - theta[len(theta)//2] 
+        # 3. Integrate to get profile curve in (u, w) plane (where w is "up" in profile frame)
+        ds = s_gen[1] - s_gen[0]
+        theta = np.cumsum(k_gen) * ds
+        # Center tangent? Maybe not necessary, but keeps it "flat" on average or at center.
+        # Let's zero theta at u=0 (approx center of paper)
+        zero_idx = np.argmin(np.abs(s_gen))
+        theta = theta - theta[zero_idx]
         
-        dx = np.cos(theta) * ds
-        dz = np.sin(theta) * ds
+        du = np.cos(theta) * ds
+        dw = np.sin(theta) * ds
         
-        x_loc = np.cumsum(dx)
-        z_loc = np.cumsum(dz)
+        u_profile = np.cumsum(du)
+        w_profile = np.cumsum(dw)
         
-        # Center the profile
-        x_loc -= x_loc[len(x_loc)//2]
-        z_loc -= z_loc[len(z_loc)//2]
+        # Adjust u_profile so it matches s_gen scale approx (arc length parameterization)
+        # u_profile starts at 0? No cumsum.
         
-        # Check Collision (Soft Constraint)
-        self.self_intersecting = self._check_self_intersection(x_loc, z_loc)
-        # We always commit state now, allowing "ghosting" with penalty
+        # Re-center profile at u=0
+        u_profile -= u_profile[zero_idx]
+        w_profile -= w_profile[zero_idx]
         
-        self.x_loc = x_loc
-        self.z_loc = z_loc
-        self.position = np.array(position, dtype=np.float32)
-        self.euler = np.array(euler_angles, dtype=np.float32)
+        # Store profile s-coordinates for ray casting
+        # s_gen is the variable along the profile curve (u in Surface Frame)
+        self.profile_s = s_gen
         
-        # 3. Generate 3D Vertices
-        # Local Grid Construction (Paper Frame)
-        # Paper extends along X (profile) and Y (width/rulings), Z is normal-ish
-        # Actually our profile is in XZ plane, width along Y.
+        # Since u_mesh determines the ARC LENGTH parameter 's' for the profile,
+        # We need X_profile(s) and Z_profile(s).
+        # Wait, s_gen IS the arc length parameter.
+        # The integration gives us position (u_prof, w_prof) in the 2D plane.
+        # Ideally u_profile approx equals s_gen if curve is flat.
         
-        X_local = x_loc[:, np.newaxis]  # (N_p, 1)
-        Z_local = z_loc[:, np.newaxis]  # (N_p, 1)
-        Y_local = self.r[np.newaxis, :] # (1, N_r)
+        # But we need to lookup (X_local, Z_local) given arc-length 's' (which is our u_mesh value).
+        # Our integration results:
+        # P(s) = ( \int cos(theta) ds, \int sin(theta) ds )
+        # This P(s) is the position in the rotated frame's (X', Z') plane.
+        # Let's call them (x_prime, z_prime).
         
-        # Broadcast to full mesh points
-        # shape (N_p, N_r)
-        X_mesh = np.repeat(X_local, self.n_rulings, axis=1)
-        Y_mesh = np.repeat(Y_local, self.n_profile, axis=0)
-        Z_mesh = np.repeat(Z_local, self.n_rulings, axis=1)
+        x_prime_gen = u_profile # This is the coordinate along the "ground" in rotated frame? No.
+        # No, u_profile is the X-coordinate in the profile plane.
+        # We integrated cos(theta) ds.
         
-        # Stack to (N_p, N_r, 3)
-        local_verts = np.stack((X_mesh, Y_mesh, Z_mesh), axis=-1)
+        z_prime_gen = w_profile
         
-        # 4. Apply 6-DoF Transformation
-        # Rotate
+        # Interpolate x_prime(s), z_prime(s) for all s in u_mesh
+        # u_mesh contains arc-length values.
+        
+        # We need to map s_gen to x_prime_gen using interpolation
+        # s_gen is the arc length input.
+        f_x = interp1d(s_gen, x_prime_gen, kind='linear', fill_value="extrapolate")
+        f_z = interp1d(s_gen, z_prime_gen, kind='linear', fill_value="extrapolate")
+        
+        profile_x = f_x(u_mesh)
+        profile_z = f_z(u_mesh)
+        
+        # Now we have surface points in the Rotated Frame:
+        # X_rot = profile_x
+        # Y_rot = v_mesh (Rulings are straight lines along Y_rot)
+        # Z_rot = profile_z
+        
+        # 4. Transform back to Paper Frame (Material Frame Aligned?? No, just un-rotate curl angle)
+        # We rotated Material Coords by -curl to get (u, v).
+        # The surface is defined in this (u, v, z) space efficiently.
+        # To get back to "Local Paper Frame" (where bounds are approx L x W), we rotate by +curl around Z.
+        
+        # P_local = R_curl @ P_rot
+        # P_rot = [profile_x, v_mesh, profile_z]
+        
+        # Rotation around Z axis (Z_rot is actually Z_local)
+        # x_local = x_rot * cos + y_rot * -sin  (Inverse rotation)
+        # y_local = x_rot * sin + y_rot * cos
+        
+        # c, s are cos(curl), sin(curl)
+        
+        # X_rot = profile_x
+        # Y_rot = v_mesh
+        
+        x_local = profile_x * c - v_mesh * s
+        y_local = profile_x * s + v_mesh * c
+        z_local = profile_z
+        
+        # Store for collision/rendering
+        # Note: self.x_loc, self.z_loc are used for calculating bbox/collision in 2D profile.
+        # With arbitrary rotation, the self-intersection check is tricky if we rely on 1D profile.
+        # But since it IS a generalized cylinder, self-intersection only happens in the 2D profile plane.
+        # So we can just check (x_prime_gen, z_prime_gen) for intersection!
+        self.self_intersecting = self._check_self_intersection(x_prime_gen, z_prime_gen)
+        
+        self.x_loc = x_prime_gen
+        self.z_loc = z_prime_gen
+        
+        # 5. Transform to World
+        # Combined Rotation
         roll, pitch, yaw = self.euler
         
-        # Rotation Matrices
-        # Rx (Roll)
-        Rx = np.array([
-            [1, 0, 0],
-            [0, np.cos(roll), -np.sin(roll)],
-            [0, np.sin(roll), np.cos(roll)]
-        ])
-        # Ry (Pitch)
-        Ry = np.array([
-            [np.cos(pitch), 0, np.sin(pitch)],
-            [0, 1, 0],
-            [-np.sin(pitch), 0, np.cos(pitch)]
-        ])
-        # Rz (Yaw)
-        Rz = np.array([
-            [np.cos(yaw), -np.sin(yaw), 0],
-            [np.sin(yaw), np.cos(yaw), 0],
-            [0, 0, 1]
-        ])
+        Rx = np.array([[1, 0, 0], [0, np.cos(roll), -np.sin(roll)], [0, np.sin(roll), np.cos(roll)]])
+        Ry = np.array([[np.cos(pitch), 0, np.sin(pitch)], [0, 1, 0], [-np.sin(pitch), 0, np.cos(pitch)]])
+        Rz = np.array([[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
         
-        # Combined R = Rz * Ry * Rx
         self.R = Rz @ Ry @ Rx
         
-        # Reshape for matrix multiplication: (N, 3)
-        N_pts = self.n_profile * self.n_rulings
-        flat_verts = local_verts.reshape(N_pts, 3)
+        # Reshape to (N, 3)
+        local_verts = np.stack((x_local, y_local, z_local), axis=-1)
+        flat_verts = local_verts.reshape(-1, 3)
         
-        # Apply Rotation: v_rot = R . v_local^T  => (3, 3) . (3, N) = (3, N) -> Transpose to (N, 3)
+        # Apply World Rotation
         rotated_verts = (self.R @ flat_verts.T).T
         
         # Apply Translation
-        world_verts = rotated_verts + self.position
+        self.vertices = (rotated_verts + self.position).reshape(self.n_profile, self.n_rulings, 3)
         
-        self.vertices = world_verts.reshape(self.n_profile, self.n_rulings, 3)
         return True
         
     def calculate_wet_area(self, rain_dir=None, resolution=100):
@@ -508,17 +580,34 @@ class PaperSim:
         origins_local = (R_inv @ (origins_world - self.position).T).T
         dirs_local = (R_inv @ dirs_world.T).T
         
+        # Transform Local -> Surface Frame (Rotate by -curl angle)
+        # We need this because the ray-surface intersection logic works in the Surface Frame (where profile is along X, rulings along Y)
+        # Local Frame: Material Frame (rotated by curl angle) -> No, Local Frame is "Paper Centered" but arbitrarily rotated by curl.
+        # Wait, self.vertices were constructed by:
+        # 1. Material (x, y) -> Rotate(-curl) -> Surface (u, v) -> Profile(u) -> 3D Surface P_surf
+        # 2. P_local = Rotate(+curl) @ P_surf
+        # So to go Local -> Surface, we Rotate(-curl).
+        
+        c = np.cos(-self.curl_angle)
+        s = np.sin(-self.curl_angle)
+        # Matrix for Rotation(-curl)
+        R_curl_inv = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+        
+        origins_surf = (R_curl_inv @ origins_local.T).T
+        dirs_surf = (R_curl_inv @ dirs_local.T).T
+        
         valid_contacts_uv = []
         valid_contacts_world = []
         
-        loc_x = self.x_loc
-        loc_z = self.z_loc
-        total_s = self.s[-1] - self.s[0]
-        s_start = self.s[0]
-
+        # Profile in Surface Frame
+        loc_x = self.x_loc # Profile X (in Surface Frame)
+        loc_z = self.z_loc # Profile Z (in Surface Frame)
+        profile_s = self.profile_s # S coordinate corresponding to loc_x/loc_z
+        
+        # Loop over drops
         for i in range(n_drops):
-            O = origins_local[i]
-            D = dirs_local[i]
+            O = origins_surf[i]
+            D = dirs_surf[i]
             Ox, Oy, Oz = O
             Dx, Dy, Dz = D
             
@@ -526,6 +615,7 @@ class PaperSim:
             hit_uv = None
             found_hit = False
             
+            # Intersect with generalized cylinder profile
             for k in range(len(loc_x) - 1):
                 Ax, Az = loc_x[k], loc_z[k]
                 Bx, Bz = loc_x[k+1], loc_z[k+1]
@@ -544,21 +634,44 @@ class PaperSim:
                 
                 if 0.0 <= u_seg <= 1.0:
                     if t_val > 0 and t_val < best_t:
-                        hit_y = Oy + t_val * Dy
-                        if -self.W/2 <= hit_y <= self.W/2:
+                        # Found intersection with infinite strip in Surface Frame
+                        hit_v_surf = Oy + t_val * Dy
+                        
+                        # We need 'u' coordinate in Surface Frame (arc length along profile)
+                        seg_len = profile_s[k+1] - profile_s[k]
+                        hit_u_surf = profile_s[k] + u_seg * seg_len
+                        
+                        # Check Bounds in Material Frame!
+                        # Transform Surface (u, v) -> Material (x, y)
+                        # We rotated Material by -curl to get Surface.
+                        # So Material = Rotate(+curl) @ Surface.
+                        
+                        # Note: hit_u_surf is the 'x' coord after rotation.
+                        # hit_v_surf is the 'y' coord after rotation.
+                        
+                        cc = np.cos(self.curl_angle)
+                        ss = np.sin(self.curl_angle)
+                        
+                        mat_x = hit_u_surf * cc - hit_v_surf * ss
+                        mat_y = hit_u_surf * ss + hit_v_surf * cc
+                        
+                        # Material Bounds: [-L/2, L/2] x [-W/2, W/2]
+                        if (-self.L/2 <= mat_x <= self.L/2) and (-self.W/2 <= mat_y <= self.W/2):
                             best_t = t_val
-                            seg_len = self.s[k+1] - self.s[k]
-                            current_s = self.s[k] + u_seg * seg_len
-                            norm_u = (current_s - s_start) / total_s
-                            norm_v = (hit_y - (-self.W/2)) / self.W
+                            
+                            norm_u = (mat_x - (-self.L/2)) / self.L
+                            norm_v = (mat_y - (-self.W/2)) / self.W
                             hit_uv = [norm_u, norm_v]
                             found_hit = True
                             
             if found_hit:
                 valid_contacts_uv.append(hit_uv)
                 # World Hit
-                P_local = O + best_t * D
-                P_world = (self.R @ P_local) + self.position
+                # We can calculate P_world from t_val on the original ray
+                # Ray was origin in World? No, Origins were Local (before surface transform).
+                # Actually we have origins_world available.
+                
+                P_world = origins_world[i] + best_t * dirs_world[i]
                 valid_contacts_world.append(P_world)
 
         if len(valid_contacts_uv) > 0:
@@ -578,7 +691,7 @@ if __name__ == "__main__":
     euler = [0, 0, 0]
     k = np.pi / 20.0
     
-    sim.update(position=pos, euler_angles=euler, curvature_controls=[k, k])
+    sim.update(position=pos, euler_angles=euler, curvature_controls=[k, k], curl_angle=np.pi/4)
     
     fig = plt.figure()
     ax = fig.add_subplot(111, projection='3d')
